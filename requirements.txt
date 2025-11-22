@@ -1,4 +1,0 @@
-# Inside tqqq_algo_trader/requirements.txt
-
-alpaca-py
-pandas
