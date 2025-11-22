@@ -2,7 +2,6 @@
 # Inside tqqq_algo_trader/run.sh
 
 # 1. Read the API keys securely from the Add-on Options and export them
-# This keeps the keys out of your public GitHub repo.
 export ALPACA_API_KEY_ID=$(bashio::config 'alpaca_api_key_id')
 export ALPACA_SECRET_KEY=$(bashio::config 'alpaca_secret_key')
 
@@ -12,6 +11,7 @@ if [ -z "$ALPACA_API_KEY_ID" ] || [ -z "$ALPACA_SECRET_KEY" ]; then
     exit 1
 fi
 
-# 2. Start the main Python script
+# 2. Start the main Python script using 'exec'
 echo "Starting TQQQ Algo Trader bot..."
-python3 /trader_bot.py
+# 🚨 FIX: Using 'exec' ensures the Python process inherits PID 1.
+exec python3 /trader_bot.py
