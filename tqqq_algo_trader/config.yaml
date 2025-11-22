@@ -1,7 +1,7 @@
 # Inside tqqq_algo_trader/config.yaml
 
 name: "TQQQ Algo Trader"
-version: "1.0.2"
+version: "1.0.3"
 slug: "tqqq_algo_trader"
 description: "Hass-tqqq-algo-trader-addon: Algorithmic Trader for TQQQ on Alpaca"
 url: "https://github.com/Wakeboardsam/Hass-tqqq-algo-trader-addon.git"  
@@ -18,5 +18,6 @@ options:
 schema:
   alpaca_api_key_id: "str"
   alpaca_secret_key: "str"
+
 
 
