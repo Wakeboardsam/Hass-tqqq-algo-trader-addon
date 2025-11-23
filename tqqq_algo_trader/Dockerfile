@@ -14,8 +14,8 @@ RUN pip3 install --no-cache-dir -r /requirements.txt --break-system-packages
 COPY trader_bot.py /trader_bot.py
 COPY run.sh /run.sh
 
-# IMPORTANT: Make run script executable (required for s6-overlay v3)
-RUN chmod a+x /run.sh
+# Fix line endings (in case of Windows CRLF) and make executable
+RUN sed -i 's/\r$//' /run.sh && chmod a+x /run.sh
 
 # Use s6-overlay's init as entrypoint (no CMD override)
 CMD [ "/run.sh" ]
