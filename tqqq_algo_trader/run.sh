@@ -1,5 +1,8 @@
-#!/usr/bin/with-contenv bashio
+#!/command/with-contenv bash
 # Inside tqqq_algo_trader/run.sh
+
+# Source bashio library
+source /usr/lib/bashio/bashio.sh
 
 bashio::log.info "Starting TQQQ Algo Trader setup..."
 
