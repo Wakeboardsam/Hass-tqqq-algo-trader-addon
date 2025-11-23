@@ -99,7 +99,8 @@ def submit_bracket_order(
         time_in_force=TimeInForce.GTC,
         order_class=OrderClass.BRACKET,
         take_profit=take_profit_request,
-        client_order_id=lot_id
+        client_order_id=lot_id,
+        extended_hours=True  # Enable extended hours trading
     )
 
     try:
@@ -133,10 +134,22 @@ def fetch_tqqq_price() -> float | None:
         return None
 
 def is_market_open() -> bool:
-    """Checks if the market is currently open."""
+    """
+    Checks if trading is available.
+    Returns True for extended hours (pre-market 4AM-9:30AM ET, after-hours 4PM-8PM ET)
+    and regular hours. Returns False only on weekends and holidays.
+    """
     try:
         clock = trading_client.get_clock()
-        return clock.is_open
+        # Trade during regular hours OR if the next open is today (extended hours available)
+        if clock.is_open:
+            return True
+        # Check if we're on a trading day (not weekend/holiday)
+        # If next_open and next_close are on the same day, we're in extended hours
+        if clock.next_open.date() == clock.next_close.date():
+            return True
+        # Otherwise we're on a weekend or holiday
+        return False
     except Exception as e:
         logger.error(f"Error checking market clock: {e}")
         return True 
