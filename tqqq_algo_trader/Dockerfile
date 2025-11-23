@@ -3,21 +3,19 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-# Install Python3 and pip explicitly
-RUN apk add --no-cache python3 py3-pip bash && \
-    ln -sf python3 /usr/bin/python
+# Install Python3 and pip
+RUN apk add --no-cache python3 py3-pip
 
-# Copy files
-COPY run.sh /run.sh
-COPY trader_bot.py /trader_bot.py
+# Copy requirements and install Python dependencies
 COPY requirements.txt /requirements.txt
-
-# Install the Python dependencies (alpaca-py and pandas)
-# FIX: Use --break-system-packages to override PEP 668 restriction 
 RUN pip3 install --no-cache-dir -r /requirements.txt --break-system-packages
 
-# Make run script executable
-RUN chmod a+x /run.sh
+# Copy application files
+COPY trader_bot.py /trader_bot.py
 
-# 🚨 FIX: Use the bash shell to execute the run script, forcing it to take PID 1.
-CMD [ "/bin/bash", "/run.sh" ]
+# Copy run script to s6-overlay services directory
+# This is the correct location for Home Assistant add-ons
+COPY run.sh /etc/services.d/tqqq_algo_trader/run
+RUN chmod a+x /etc/services.d/tqqq_algo_trader/run
+
+# No CMD needed - s6-overlay handles initialization
