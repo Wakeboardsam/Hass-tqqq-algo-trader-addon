@@ -3,8 +3,8 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-# Install Python3 and pip
-RUN apk add --no-cache python3 py3-pip
+# Install bash, Python3 and pip
+RUN apk add --no-cache bash python3 py3-pip
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt /requirements.txt
