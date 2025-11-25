@@ -4,20 +4,22 @@ import os
 import sqlite3
 import time
 import logging
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional
+from dataclasses import dataclass
+from typing import List, Optional
 from datetime import datetime, timedelta
 
 import yaml
 from aiohttp import web
 
-# ---------- Alpaca-py Imports ----------
+# ---------- Alpaca-py Imports (UPDATED) ----------
+# Note: You must use the new, separate clients for Trading and Data
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+# Note: sqlite-utils and python-dotenv will be imported implicitly via your uses of os.environ and sqlite3
 
 # ---------- Logging ----------
 LOG_FILE = os.environ.get("LOG_FILE", "/data/tqqq-bot/bot.log")
@@ -32,13 +34,20 @@ logger = logging.getLogger("tqqq-bot")
 BOT_CONFIG = os.environ.get("BOT_CONFIG", "/data/tqqq-bot/config.yaml")
 LEDGER_DB = os.environ.get("LEDGER_DB", "/data/tqqq-bot/ledger_v2.db")
 
-with open(BOT_CONFIG, 'r') as f:
-    cfg = yaml.safe_load(f)
+try:
+    with open(BOT_CONFIG, 'r') as f:
+        cfg = yaml.safe_load(f)
+except FileNotFoundError:
+    logger.error(f"Config file not found at {BOT_CONFIG}")
+    cfg = {}
+except Exception:
+    logger.exception("Error loading config file")
+    cfg = {}
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", cfg.get("alpaca", {}).get("api_key", ""))
 ALPACA_API_SECRET = os.environ.get("ALPACA_API_SECRET", cfg.get("alpaca", {}).get("api_secret", ""))
 USE_PAPER = cfg.get("alpaca", {}).get("use_paper", True)
-# Note: Base URL is handled automatically by TradingClient based on 'paper=True/False'
+# Note: ALPACA_BASE is no longer required for alpaca-py client initialization
 
 SYMBOL = cfg.get("symbol", "TQQQ")
 RF = float(cfg.get("reduction_factor", 0.95))
@@ -51,19 +60,24 @@ MAX_POSITION_SHARES = int(cfg.get("max_position_shares", 200000))
 WEBUI_PORT = int(cfg.get("webui", {}).get("port", 8080))
 LOG_TAIL = int(cfg.get("log_tail_lines", 200))
 
-# ---------- Alpaca Client Setup ----------
+# ---------- Alpaca Client Setup (UPDATED) ----------
 api: Optional[TradingClient] = None
 data_api: Optional[StockHistoricalDataClient] = None
 
 if ALPACA_API_KEY and ALPACA_API_SECRET:
     try:
+        # Trading Client (for orders and positions)
         api = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=USE_PAPER)
+        # Data Client (for price fetching)
         data_api = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
         logger.info(f"Alpaca clients initialized (Paper: {USE_PAPER})")
     except Exception as e:
         logger.error(f"Failed to initialize Alpaca clients: {e}")
+        api = None
+        data_api = None
 else:
     logger.warning("Alpaca credentials not found. API features disabled.")
+
 
 # ---------- SQLite ledger setup ----------
 conn = sqlite3.connect(LEDGER_DB, check_same_thread=False)
@@ -101,7 +115,7 @@ class VirtualLot:
     virtual_cost: float
     buy_price: float
     sell_target: float
-    status: str  # OPEN or CLOSED
+    status: str  # PENDING, OPEN, or CLOSED
 
 # ---------- Utility functions ----------
 def tail_log(n: int = LOG_TAIL) -> str:
@@ -142,24 +156,23 @@ def compute_allocation_levels(initial_price: float, starting_cash: float, rf: fl
         allocations.append({"level": i+1, "buy_price": buy_price, "alloc_cash": alloc})
     return allocations
 
+# Logic updated to use 'PENDING' status for safe initialization
 def seed_virtual_ledger_if_empty():
     cur.execute("SELECT COUNT(1) FROM virtual_lots")
     if cur.fetchone()[0] > 0:
         return
     
-    # seed initial price
     p = INITIAL_PRICE
     if (not p or p <= 0) and data_api:
         try:
             # Fetch latest 1 minute bar as fallback for current price
             req = StockBarsRequest(
-                symbol_or_symbols=SYMBOL,
+                symbol_or_symbols=[SYMBOL],
                 timeframe=TimeFrame.Minute,
-                start=datetime.now() - timedelta(days=1),
                 limit=1
             )
             bars = data_api.get_stock_bars(req)
-            if bars and SYMBOL in bars:
+            if bars and SYMBOL in bars and len(bars[SYMBOL]) > 0:
                  p = bars[SYMBOL][0].close
         except Exception:
             logger.exception("Failed to fetch market price to seed; using configured initial_price if set")
@@ -172,14 +185,17 @@ def seed_virtual_ledger_if_empty():
     for a in allocs:
         shares = max(MIN_ORDER_SHARES, int(a["alloc_cash"] // a["buy_price"]))
         sell_target = round(a["buy_price"] + (p * 0.01), 8)  # profit = 1% of initial price
+        
+        # New lots are marked 'PENDING' until the buy price is hit
         cur.execute("""INSERT OR IGNORE INTO virtual_lots
             (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at)
             VALUES (?,?,?,?,?,?,?)""",
-            (a["level"], shares, a["buy_price"]*shares, a["buy_price"], sell_target, "OPEN", int(time.time())))
+            (a["level"], shares, a["buy_price"]*shares, a["buy_price"], sell_target, "PENDING", int(time.time())))
     conn.commit()
 
 def load_open_virtual_lots() -> List[VirtualLot]:
-    cur.execute("SELECT level, virtual_shares, virtual_cost, buy_price, sell_target, status FROM virtual_lots ORDER BY level")
+    # Changed to load only OPEN lots (those currently held)
+    cur.execute("SELECT level, virtual_shares, virtual_cost, buy_price, sell_target, status FROM virtual_lots WHERE status='OPEN' ORDER BY level")
     return [VirtualLot(*r) for r in cur.fetchall()]
 
 # ---------- Alpaca helpers (UPDATED for alpaca-py) ----------
@@ -188,8 +204,9 @@ def get_latest_price() -> Optional[float]:
         return None
     try:
         # Latest Trade
-        req = StockLatestTradeRequest(symbol_or_symbols=SYMBOL)
+        req = StockLatestTradeRequest(symbol_or_symbols=[SYMBOL])
         trade = data_api.get_stock_latest_trade(req)
+        # The result is a dictionary mapping symbol to trade object
         return float(trade[SYMBOL].price)
     except Exception:
         pass # Fallback to bars
@@ -197,13 +214,12 @@ def get_latest_price() -> Optional[float]:
     try:
         # Fallback: minute bar
         req = StockBarsRequest(
-            symbol_or_symbols=SYMBOL,
+            symbol_or_symbols=[SYMBOL],
             timeframe=TimeFrame.Minute,
-            start=datetime.now() - timedelta(days=1),
             limit=1
         )
         bars = data_api.get_stock_bars(req)
-        if bars and SYMBOL in bars:
+        if bars and SYMBOL in bars and len(bars[SYMBOL]) > 0:
              return float(bars[SYMBOL][0].close)
     except Exception:
         logger.exception("Price fetch failed")
@@ -213,15 +229,10 @@ def get_actual_position_shares() -> int:
     if not api:
         return 0
     try:
-        # get_all_positions returns a list, find specific symbol
-        # Or easier: get_open_position(symbol) raises 404 if not found
-        try:
-            p = api.get_open_position(SYMBOL)
-            return int(float(p.qty))
-        except Exception:
-            return 0 # Position likely doesn't exist
+        # get_open_position raises a 404 exception if no position exists.
+        p = api.get_open_position(SYMBOL)
+        return int(float(p.qty))
     except Exception:
-        logger.exception("Failed to get position")
         return 0
 
 def place_market_order(side_str: str, qty: int) -> Optional[str]:
@@ -249,6 +260,7 @@ def place_market_order(side_str: str, qty: int) -> Optional[str]:
         return None
 
 def place_limit_order(side_str: str, qty: int, price: float) -> Optional[str]:
+    # This function is not used in the original trading loop, but is updated for completeness.
     if qty <= 0 or not api:
         return None
 
@@ -281,7 +293,7 @@ def reconcile_orders():
         rows = cur.fetchall()
         for rid, aid in rows:
             try:
-                # Get specific order by ID
+                # get_order_by_id is used in alpaca-py
                 o = api.get_order_by_id(aid)
                 cur.execute("UPDATE orders SET status=? WHERE id=?", (str(o.status), rid))
             except Exception:
@@ -298,17 +310,15 @@ def is_paused() -> bool:
 def set_paused(val: bool):
     write_meta("paused", "1" if val else "0")
 
-# ---------- Core trading loop ----------
+# ---------- Core trading loop (UPDATED Logic) ----------
 async def trading_loop():
     logger.info("Starting trading loop")
     
-    # Ensure seeding happens inside the loop (or right before)
-    # We do it here to ensure data_api is ready if needed
     try:
         seed_virtual_ledger_if_empty()
     except Exception as e:
         logger.critical(f"Failed to seed ledger: {e}")
-        # We might want to stop or retry, but let's loop carefully
+        # Continue loop but logging critical error.
     
     while True:
         try:
@@ -319,410 +329,83 @@ async def trading_loop():
 
             price = get_latest_price()
             if price is None:
-                # logger.warning("Could not fetch price. Retrying...")
                 await asyncio.sleep(POLL_MS/1000)
                 continue
 
-            # SELL logic: any OPEN virtual lot with sell_target <= price -> sell that lot's virtual_shares
-            open_lots = load_open_virtual_lots()
-            for lot in open_lots:
-                if lot.status == "OPEN" and price >= lot.sell_target:
-                    actual_shares = get_actual_position_shares()
-                    if actual_shares <= 0:
-                        logger.info("No actual shares available to sell (FIFO safety). Skipping sell for level %s", lot.level)
-                        continue
-                    qty = int(lot.virtual_shares)
-                    qty = max(1, qty)
-                    logger.info("SELL TRIGGER level=%s sell_target=%s price=%s qty=%s", lot.level, lot.sell_target, price, qty)
-                    place_market_order("sell", qty)
-                    cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (lot.level,))
-                    conn.commit()
-
-            # BUY logic: if price <= buy_price (buy triggers)
-            # Ensure we don't exceed MAX_POSITION_SHARES
+            # 1. SELL logic: Check all lots currently held ('OPEN')
             actual_shares = get_actual_position_shares()
-            cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='OPEN' ORDER BY level")
-            rows = cur.fetchall()
+            cur.execute("SELECT level, virtual_shares, sell_target FROM virtual_lots WHERE status='OPEN' ORDER BY level")
+            open_lots = cur.fetchall()
             
-            # We must be careful not to double-buy. 
-            # The original logic relies on the loop: if it's OPEN and price < buy_price, it buys?
-            # WAIT: The original code logic seems to imply it buys ONLY ONCE per level.
-            # But the original code didn't mark it as 'BOUGHT'.
-            # It relies on: "if price <= buy_price" ... "place_market_order". 
-            # BUT: "Keep virtual lot OPEN until sold".
-            # ISSUE: If price stays low, this loop will buy infinitely every POLL_MS.
-            # FIX: We need a status that says "FILLED" or "Active". 
-            # However, looking at the original logic provided:
-            # "Keep virtual lot OPEN until sold" implies it stays in the list.
-            # If we don't change state, it WILL buy again. 
-            # Assuming the original user wanted to buy ONCE when price crosses.
-            # I will add a check: we should probably only buy if we don't hold it? 
-            # Or is this a grid bot that accumulates? 
-            # Based on standard grid logic: you buy once per level.
-            # The table has `status`. I will assume we need a state like 'HOLDING' or checks against orders.
-            # FOR NOW: I will replicate the original logic but adding a safety check 
-            # to prevent infinite buying of the same level in 500ms intervals.
-            # The original code:
-            #   place_market_order("buy", qty)
-            #   actual_shares += qty
-            #   # Keep virtual lot OPEN until sold
-            # This is dangerous. I will add a local check or we assume the `status` column 
-            # was meant to track "Waiting to Buy" vs "Holding".
-            # Given the schema only has OPEN/CLOSED, I will assume OPEN means "Active/Holding/Waiting to Sell".
-            # The BUY trigger likely needs to check if we already bought this level.
-            # I will modify the logic slightly to be safe: 
-            # If we have an OPEN lot, we assume we OWN it (or are trying to buy it). 
-            # So we should NOT buy it again.
-            
-            # WAIT - if the logic is "Price dropped to level X, BUY", and we already did...
-            # The original code provided has a flaw: it loops `rows` (which are OPEN lots).
-            # If I have an OPEN lot at level 10 (buy=100), and price is 99.
-            # It buys. Lot stays OPEN. Next loop price 99. It buys again.
-            # CORRECTIVE ACTION: I will assume `OPEN` means "We are holding this position".
-            # We only BUY if we are NOT holding it? 
-            # Actually, standard grid bots generate the lot when they buy. 
-            # This bot pre-generates lots (seed_virtual_ledger).
-            # So: Pre-generated lots should probably be "PENDING" then "OPEN"(holding) then "CLOSED"(sold).
-            # Since I cannot change the schema easily without migration, I will assume:
-            # If `status` is OPEN, we are ALREADY holding it (or waiting to sell it).
-            # We should NOT buy again.
-            # So where is the logic to "buy when price drops"?
-            # If the lot is OPEN, we have it. 
-            # If the lot is CLOSED, we sold it.
-            # We need a state for "Ready to Buy".
-            # I will add a column 'is_holding' logic using `meta` or just infer it?
-            # INFERENCE: If we pre-seed everything as OPEN, the bot thinks we own everything at start.
-            # That assumes we start fully invested? 
-            # `seed_virtual_ledger` sets status='OPEN'. 
-            # If `OPEN` = "We own it", then the BUY logic below is redundant/wrong for pre-seeded lots?
-            #
-            # LET'S RE-READ CAREFULLY:
-            # `allocs = compute_allocation_levels(...)`
-            # `INSERT ... VALUES (..., "OPEN", ...)`
-            # So we start with 88 OPEN lots.
-            # Then `BUY logic`: `for level, vshares, buy_price in rows` (ALL OPEN LOTS).
-            # `if price <= buy_price`: BUY.
-            # This WILL buy every cycle.
-            # 
-            # FIX: I will implement a "last_buy_timestamp" check or simpler:
-            # A 'PENDING' status is required. 
-            # I will modify the seeding to set status='PENDING' for lots below current price?
-            # Or simpler: The user probably wants to buy ONLY if we don't have the shares?
-            #
-            # ALTERNATIVE INTERPRETATION: 
-            # The bot is a "DCA" bot. It buys when price dips.
-            # I will add a 'hold_status' check.
-            # Since I can't easily change the DB schema in this single file paste (user might have existing DB),
-            # I will use the 'meta' table to track "bought_levels".
-            
-            # ... IMPLEMENTING "bought_levels" tracking in memory or meta to prevent infinite buys ...
-            # Actually, looking at `orders` table is better.
-            # If we have a filled BUY order for this level that hasn't been sold?
-            # That's complex.
-            
-            # DECISION: I will add a `filled` flag to the `virtual_lots` table if it doesn't exist?
-            # No, I'll use the `status` field.
-            # Statuses: 'WAITING' (Ready to buy), 'OPEN' (Bought/Holding), 'CLOSED' (Sold).
-            # I will update `seed_virtual_ledger` to default to 'WAITING' instead of 'OPEN'?
-            # If I change 'OPEN' meaning now, existing DBs might break.
-            #
-            # SAFETY FALLBACK: 
-            # I will check if we placed a BUY order for this level recently?
-            # No.
-            #
-            # LET'S LOOK AT THE ORIGINAL CODE BEHAVIOR:
-            # The user provided code MIGHT have been incomplete or buggy.
-            # But "OPEN" usually means "Trade is active".
-            # If "Trade is active", why check `if price <= buy_price` to BUY?
-            # Usually you buy to OPEN a trade.
-            #
-            # HYPOTHESIS: The user wants to buy IF status is OPEN (defined as "active strategy level") AND we don't have the shares?
-            # But we can't easily know if specific shares belong to specific levels without lot tracking.
-            #
-            # PROPOSED FIX FOR USER:
-            # I will change the logic to:
-            # 1. Seed as 'PENDING'.
-            # 2. Buy if 'PENDING' and price <= target. -> Set to 'OPEN'.
-            # 3. Sell if 'OPEN' and price >= target. -> Set to 'CLOSED'.
-            # 4. (Optional) Reset 'CLOSED' to 'PENDING' if price drops again? (Grid bot style).
-            #
-            # FOR SAFETY: I will stick to the User's schema but introduce 'PENDING'.
-            # IF DB exists with 'OPEN', we treat them as 'Holding'.
-            
-            # New Logic Block:
-            # Fetch 'PENDING' lots. If price <= buy_price -> Buy -> Update to 'OPEN'.
-            # Fetch 'OPEN' lots. If price >= sell_target -> Sell -> Update to 'CLOSED'.
-            
-            # To support existing DBs (where everything is OPEN):
-            # If everything is OPEN, the original code would panic buy everything below price.
-            # I will assume the user handles this or it's a fresh start.
-            # I will use 'PENDING' for new seeds.
-            
-            pass 
-
-            # --- END OF THOUGHT PROCESS ---
-            
-            # RESUMING ACTUAL CODE WRITING (I will implement the PENDING/OPEN/CLOSED logic for safety)
-            # Re-implementing tLEVELS = int(cfg.get("levels", 88))
-INITIAL_CASH = float(cfg.get("initial_cash", 250000))
-INITIAL_PRICE = float(cfg.get("initial_price", 0.0))
-POLL_MS = int(cfg.get("poll_interval_ms", 500))
-MIN_ORDER_SHARES = int(cfg.get("min_order_shares", 1))
-MAX_POSITION_SHARES = int(cfg.get("max_position_shares", 200000))
-WEBUI_PORT = int(cfg.get("webui", {}).get("port", 8080))
-LOG_TAIL = int(cfg.get("log_tail_lines", 200))
-
-# Alpaca REST client
-if ALPACA_API_KEY and ALPACA_API_SECRET:
-    api = REST(ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_BASE, api_version='v2')
-else:
-    api = None
-
-# ---------- SQLite ledger setup ----------
-conn = sqlite3.connect(LEDGER_DB, check_same_thread=False)
-cur = conn.cursor()
-cur.executescript("""
-CREATE TABLE IF NOT EXISTS virtual_lots (
-    level INTEGER PRIMARY KEY,
-    virtual_shares INTEGER,
-    virtual_cost REAL,
-    buy_price REAL,
-    sell_target REAL,
-    status TEXT,
-    created_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    alpaca_id TEXT,
-    side TEXT,
-    qty INTEGER,
-    price REAL,
-    status TEXT,
-    created_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    val TEXT
-);
-""")
-conn.commit()
-
-@dataclass
-class VirtualLot:
-    level: int
-    virtual_shares: int
-    virtual_cost: float
-    buy_price: float
-    sell_target: float
-    status: str  # OPEN or CLOSED
-
-# ---------- Utility functions ----------
-def tail_log(n: int = LOG_TAIL) -> str:
-    try:
-        with open(LOG_FILE, 'r') as f:
-            lines = f.readlines()
-        return "".join(lines[-n:])
-    except Exception:
-        return ""
-
-def clear_log():
-    try:
-        open(LOG_FILE, 'w').close()
-        logger.info("Log cleared via web UI")
-        return True
-    except Exception as e:
-        logger.exception("Failed clearing log")
-        return False
-
-def write_meta(key: str, val: str):
-    cur.execute("INSERT OR REPLACE INTO meta (key,val) VALUES (?,?)", (key, val))
-    conn.commit()
-
-def read_meta(key: str) -> Optional[str]:
-    cur.execute("SELECT val FROM meta WHERE key=?", (key,))
-    r = cur.fetchone()
-    return r[0] if r else None
-
-# ---------- Reduction-factor allocation ----------
-def compute_allocation_levels(initial_price: float, starting_cash: float, rf: float, levels: int):
-    step = round(initial_price * 0.01, 8)  # 1% step based on initial price
-    denom = (1 - (rf ** levels)) if rf != 1.0 else levels
-    base_alloc_factor = (1 - rf) / denom
-    allocations = []
-    for i in range(levels):
-        alloc = starting_cash * base_alloc_factor * (rf ** i)
-        buy_price = round(initial_price - i * step, 8)
-        allocations.append({"level": i+1, "buy_price": buy_price, "alloc_cash": alloc})
-    return allocations
-
-def seed_virtual_ledger_if_empty():
-    cur.execute("SELECT COUNT(1) FROM virtual_lots")
-    if cur.fetchone()[0] > 0:
-        return
-    # seed initial price
-    p = INITIAL_PRICE
-    if not p or p <= 0:
-        try:
-            if api:
-                bar = api.get_barset(SYMBOL, 'minute', limit=1)
-                if bar and len(bar[SYMBOL])>0:
-                    p = float(bar[SYMBOL][0].c)
-        except Exception:
-            logger.exception("Failed to fetch market price to seed; using configured initial_price if set")
-    if not p or p <= 0:
-        raise RuntimeError("No initial price available to seed ledger. Set initial_price in config or ensure Alpaca keys are configured.")
-    logger.info(f"Seeding virtual ledger at initial price {p}")
-    allocs = compute_allocation_levels(p, INITIAL_CASH, RF, LEVELS)
-    for a in allocs:
-        shares = max(MIN_ORDER_SHARES, int(a["alloc_cash"] // a["buy_price"]))
-        sell_target = round(a["buy_price"] + (p * 0.01), 8)  # profit = 1% of initial price
-        cur.execute("""INSERT OR IGNORE INTO virtual_lots
-            (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at)
-            VALUES (?,?,?,?,?,?,?)""",
-            (a["level"], shares, a["buy_price"]*shares, a["buy_price"], sell_target, "OPEN", int(time.time())))
-    conn.commit()
-
-def load_open_virtual_lots() -> List[VirtualLot]:
-    cur.execute("SELECT level, virtual_shares, virtual_cost, buy_price, sell_target, status FROM virtual_lots ORDER BY level")
-    return [VirtualLot(*r) for r in cur.fetchall()]
-
-# ---------- Alpaca helpers ----------
-def get_latest_price() -> Optional[float]:
-    try:
-        if api:
-            trade = api.get_latest_trade(SYMBOL)
-            return float(trade.price)
-    except Exception:
-        logger.exception("Failed to fetch latest trade")
-    # fallback: minute bar
-    try:
-        if api:
-            bars = api.get_barset(SYMBOL, 'minute', limit=1)
-            if bars and len(bars[SYMBOL])>0:
-                return float(bars[SYMBOL][0].c)
-    except Exception:
-        logger.exception("Fallback price fetch failed")
-    return None
-
-def get_actual_position_shares() -> int:
-    try:
-        if api:
-            p = api.get_position(SYMBOL)
-            return int(float(p.qty))
-    except Exception:
-        return 0
-
-def place_market_order(side: str, qty: int) -> Optional[str]:
-    if qty <= 0 or not api:
-        return None
-    try:
-        order = api.submit_order(symbol=SYMBOL, qty=qty, side=side, type='market', time_in_force='day')
-        cur.execute("INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) VALUES (?,?,?,?,?,?)",
-                    (order.id, side, qty, 0.0, order.status, int(time.time())))
-        conn.commit()
-        logger.info(f"Placed market {side} order qty={qty}")
-        return order.id
-    except Exception as e:
-        logger.exception("Market order failed")
-        return None
-
-def place_limit_order(side: str, qty: int, price: float) -> Optional[str]:
-    if qty <= 0 or not api:
-        return None
-    try:
-        order = api.submit_order(symbol=SYMBOL, qty=qty, side=side, type='limit', time_in_force='day', limit_price=price)
-        cur.execute("INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) VALUES (?,?,?,?,?,?)",
-                    (order.id, side, qty, price, order.status, int(time.time())))
-        conn.commit()
-        logger.info(f"Placed limit {side} order qty={qty} @ {price}")
-        return order.id
-    except Exception:
-        logger.exception("Limit order failed")
-        return None
-
-def reconcile_orders():
-    try:
-        cur.execute("SELECT id, alpaca_id FROM orders WHERE status NOT IN ('filled','canceled')")
-        rows = cur.fetchall()
-        for rid, aid in rows:
-            try:
-                o = api.get_order(aid)
-                cur.execute("UPDATE orders SET status=? WHERE id=?", (o.status, rid))
-            except Exception:
-                pass
-        conn.commit()
-    except Exception:
-        logger.exception("Reconcile failed")
-
-# ---------- Safety / Maintenance ----------
-def is_paused() -> bool:
-    v = read_meta("paused")
-    return v == "1"
-
-def set_paused(val: bool):
-    write_meta("paused", "1" if val else "0")
-
-# ---------- Core trading loop ----------
-async def trading_loop():
-    seed_virtual_ledger_if_empty()
-    logger.info("Starting trading loop")
-    while True:
-        try:
-            if is_paused():
-                logger.info("Bot is paused (maintenance). Sleeping.")
-                await asyncio.sleep(POLL_MS/1000)
-                continue
-
-            price = get_latest_price()
-            if price is None:
-                await asyncio.sleep(POLL_MS/1000)
-                continue
-
-            # SELL logic: any OPEN virtual lot with sell_target <= price -> sell that lot's virtual_shares
-            open_lots = load_open_virtual_lots()
-            for lot in open_lots:
-                if lot.status == "OPEN" and price >= lot.sell_target:
-                    actual_shares = get_actual_position_shares()
-                    if actual_shares <= 0:
-                        logger.info("No actual shares available to sell (FIFO safety). Skipping sell for level %s", lot.level)
+            for level, vshares, sell_target in open_lots:
+                if price >= sell_target:
+                    # Safety check: if position is smaller than lot, sell available
+                    qty = min(int(vshares), actual_shares) 
+                    
+                    if qty < MIN_ORDER_SHARES:
+                        logger.warning("Attempted sell qty less than MIN_ORDER_SHARES or actual position too low for FIFO safety. Skipping sell for level %s", level)
                         continue
-                    qty = int(lot.virtual_shares)
-                    qty = max(1, qty)
-                    logger.info("SELL TRIGGER level=%s sell_target=%s price=%s qty=%s", lot.level, lot.sell_target, price, qty)
-                    place_market_order("sell", qty)
-                    cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (lot.level,))
-                    conn.commit()
+                        
+                    logger.info("SELL TRIGGER level=%s sell_target=%s price=%s qty=%s", level, sell_target, price, qty)
+                    
+                    # We assume place_market_order uses LIFO/FIFO correctly if needed, but for Alpaca it's a net change.
+                    # Placing a SELL order
+                    if place_market_order("sell", qty):
+                        # Mark this lot as CLOSED (sold)
+                        cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (level,))
+                        conn.commit()
+                    # Actual shares will be updated on the next loop iteration
 
-            # BUY logic: if price <= buy_price (buy triggers)
-            # Ensure we don't exceed MAX_POSITION_SHARES
-            actual_shares = get_actual_position_shares()
-            cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='OPEN' ORDER BY level")
-            rows = cur.fetchall()
-            for level, vshares, buy_price in rows:
+            # 2. BUY logic: Check all lots waiting to be bought ('PENDING')
+            cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING' ORDER BY level DESC")
+            pending_rows = cur.fetchall()
+            
+            actual_shares = get_actual_position_shares() # Re-fetch updated position after sells
+            
+            for level, vshares, buy_price in pending_rows:
                 if price <= buy_price:
+                    # Check safety cap before buying
                     if actual_shares + vshares > MAX_POSITION_SHARES:
                         logger.info("Safety cap would be exceeded; skipping buy for level %s", level)
                         continue
+                        
                     qty = int(vshares)
+                    if qty < MIN_ORDER_SHARES:
+                        logger.warning("Attempted buy qty less than MIN_ORDER_SHARES. Skipping buy for level %s", level)
+                        continue
+                        
                     logger.info("BUY TRIGGER level=%s buy_price=%s price=%s qty=%s", level, buy_price, price, qty)
-                    place_market_order("buy", qty)
-                    actual_shares += qty
-                    # Keep virtual lot OPEN until sold
-            # reconcile orders
+                    
+                    # Placing a BUY order
+                    if place_market_order("buy", qty):
+                        # Mark this lot as OPEN (holding)
+                        cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE level=?", (level,))
+                        conn.commit()
+                        actual_shares += qty # Optimistically update shares for current cycle checks
+
+            # 3. Reconcile orders
             reconcile_orders()
+            
         except Exception:
             logger.exception("Exception in trading loop")
+            
         await asyncio.sleep(POLL_MS/1000)
 
 # ---------- Web UI (aiohttp) ----------
+# (Remaining Web UI functions are correct and unchanged)
+
 async def handle_index(request):
     price = get_latest_price()
     pos = get_actual_position_shares()
-    # compute cost basis approximate from virtual ledger: sum virtual_cost of CLOSED lots as realized? show open virtual cost
+    # compute cost basis approximate from virtual ledger: sum virtual_cost of OPEN and CLOSED lots
     cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='OPEN'")
-    open_cost = cur.fetchone()[0] or 0.0
+    r = cur.fetchone()
+    open_cost = r[0] if r and r[0] else 0.0
+    
     cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='CLOSED'")
-    closed_cost = cur.fetchone()[0] or 0.0
+    r = cur.fetchone()
+    closed_cost = r[0] if r and r[0] else 0.0
+    
     html = f"""
     <html>
     <head><title>TQQQ Bot Status</title></head>
@@ -807,11 +490,8 @@ def create_web_app():
 
 # ---------- Main ----------
 async def main():
-    # start trading loop and web server in parallel
-    logger.info("Starting TQQQ bot v2")
-    # ensure ledger seeded
-    seed_virtual_ledger_if_empty()
-
+    logger.info("Starting TQQQ bot v2 (alpaca-py)")
+    
     loop = asyncio.get_event_loop()
     app = create_web_app()
     runner = web.AppRunner(app)
@@ -820,7 +500,6 @@ async def main():
     await site.start()
     logger.info(f"Web UI listening on port {WEBUI_PORT}")
 
-    # run trading loop forever
     await trading_loop()
 
 if __name__ == "__main__":
