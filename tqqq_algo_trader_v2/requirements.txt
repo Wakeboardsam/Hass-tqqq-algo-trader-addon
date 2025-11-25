@@ -1,5 +1,5 @@
 # tqqq_algo_trader_v2/requirements.txt
-alpaca-trade-api==4.1.0
+alpaca-py
 aiohttp==3.8.4
 PyYAML==6.0
 sqlite-utils==3.44.0
