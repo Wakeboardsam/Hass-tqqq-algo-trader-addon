@@ -8,7 +8,7 @@ RUN apk add --no-cache python3 py3-pip bash
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN pip3 install --no-cache-dir -r /app/requirements.txt
+RUN pip3 install --no-cache-dir -r /app/requirements.txt --break-system-packages
 
 COPY run.sh /run.sh
 COPY trader_bot.py /app/trader_bot.py
