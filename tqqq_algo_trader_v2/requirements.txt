@@ -1,6 +1,6 @@
 # tqqq_algo_trader_v2/requirements.txt
 alpaca-py
 aiohttp==3.8.4
-PyYAML==6.0
+PyYAML
 sqlite-utils==3.44.0
 python-dotenv==1.0.0
