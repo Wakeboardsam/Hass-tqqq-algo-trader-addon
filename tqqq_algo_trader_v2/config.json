@@ -1,6 +1,6 @@
 {
   "name": "TQQQ Grid Bot v2",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "slug": "tqqq_algo_trader_v2",
   "description": "Alpaca Grid Bot using a virtual ledger (Alpaca-compatible) with built-in web UI",
   "arch": ["amd64", "armv7", "aarch64", "armhf"],
