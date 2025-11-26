@@ -12,15 +12,14 @@ RUN apk add --no-cache \
 COPY requirements.txt /requirements.txt
 RUN pip3 install --no-cache-dir -r /requirements.txt --break-system-packages
 
-# Copy application files to root
+# Copy application files
 COPY trader_bot.py /trader_bot.py
 COPY webui_assets.py /webui_assets.py
 COPY default_config.yaml /default_config.yaml
 
-# Copy run script
-COPY run.sh /run.sh
+# Copy run script to S6 services directory
+COPY run.sh /etc/services.d/tqqq-bot/run
 
 # Fix line endings and make executable
-RUN sed -i 's/\r$//' /run.sh && chmod a+x /run.sh
-
-CMD [ "/run.sh" ]
+RUN sed -i 's/\r$//' /etc/services.d/tqqq-bot/run && \
+    chmod a+x /etc/services.d/tqqq-bot/run
