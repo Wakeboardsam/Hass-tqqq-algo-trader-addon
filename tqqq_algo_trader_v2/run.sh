@@ -17,11 +17,4 @@ export LOG_FILE="/data/tqqq-bot/bot.log"
 
 # Start the bot as PID 1
 echo "[INFO] Launching TQQQ Algo Trader V2..."
-exec python3 /app/trader_bot.pyexport BOT_CONFIG="/data/tqqq-bot/config.yaml"
-export LEDGER_DB="/data/tqqq-bot/ledger_v2.db"
-export LOG_FILE="/data/tqqq-bot/bot.log"
-
-# Start the bot as PID 1 of this container process
-# 'exec' is the critical fix for the s6-overlay: fatal: can only run as pid 1 error.
-echo "[INFO] Launching TQQQ Algo Trader V2..."
 exec python3 /app/trader_bot.py
