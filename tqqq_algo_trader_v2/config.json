@@ -2,8 +2,9 @@
   "name": "TQQQ Grid Bot v2",
   "version": "0.1.21",
   "slug": "tqqq_algo_trader_v2",
-  "description": "Alpaca Grid Bot using a virtual ledger (Alpaca-compatible) with built-in web UI",
+  "description": "Alpaca Grid Bot using a virtual ledger...",
   "arch": ["amd64", "armv7", "aarch64", "armhf"],
+  "init": false,  <-- ADD THIS LINE HERE
   "startup": "services",
   "boot": "auto",
   "ports": {
