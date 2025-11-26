@@ -12,14 +12,12 @@ import yaml
 from aiohttp import web
 
 # ---------- Alpaca-py Imports (UPDATED) ----------
-# Note: You must use the new, separate clients for Trading and Data
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-# Note: sqlite-utils and python-dotenv will be imported implicitly via your uses of os.environ and sqlite3
 
 # ---------- Logging ----------
 LOG_FILE = os.environ.get("LOG_FILE", "/data/tqqq-bot/bot.log")
@@ -44,8 +42,13 @@ except Exception:
     logger.exception("Error loading config file")
     cfg = {}
 
-ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", cfg.get("alpaca", {}).get("api_key", ""))
-ALPACA_API_SECRET = os.environ.get("ALPACA_API_SECRET", cfg.get("alpaca", {}).get("api_secret", ""))
+# --- FIX START: Prioritize Environment Variables for API Keys ---
+# The environment variables (set by run.sh) are the authoritative source.
+# We no longer fall back to config.yaml for keys, as config.yaml defaults to empty.
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY") 
+ALPACA_API_SECRET = os.environ.get("ALPACA_SECRET_KEY")
+# --- FIX END ---
+
 USE_PAPER = cfg.get("alpaca", {}).get("use_paper", True)
 # Note: ALPACA_BASE is no longer required for alpaca-py client initialization
 
@@ -64,6 +67,7 @@ LOG_TAIL = int(cfg.get("log_tail_lines", 200))
 api: Optional[TradingClient] = None
 data_api: Optional[StockHistoricalDataClient] = None
 
+# This check is now robust because ALPACA_API_KEY and ALPACA_SECRET_KEY contain the values from run.sh
 if ALPACA_API_KEY and ALPACA_API_SECRET:
     try:
         # Trading Client (for orders and positions)
