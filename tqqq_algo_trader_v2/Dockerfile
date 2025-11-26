@@ -3,10 +3,8 @@ FROM $BUILD_FROM
 
 # Install packages
 RUN apk add --no-cache \
-    jq \
     python3 \
-    py3-pip \
-    bash
+    py3-pip
 
 # Copy and install Python requirements
 COPY requirements.txt /requirements.txt
@@ -17,9 +15,14 @@ COPY trader_bot.py /trader_bot.py
 COPY webui_assets.py /webui_assets.py
 COPY default_config.yaml /default_config.yaml
 
-# Copy run script to S6 services directory
-COPY run.sh /etc/services.d/tqqq-bot/run
+# Create data directory and setup
+RUN mkdir -p /data/tqqq-bot && \
+    cp /default_config.yaml /data/tqqq-bot/config.yaml
 
-# Fix line endings and make executable
-RUN sed -i 's/\r$//' /etc/services.d/tqqq-bot/run && \
-    chmod a+x /etc/services.d/tqqq-bot/run
+# Set environment variables
+ENV BOT_CONFIG="/data/tqqq-bot/config.yaml"
+ENV LEDGER_DB="/data/tqqq-bot/ledger_v2.db"
+ENV LOG_FILE="/data/tqqq-bot/bot.log"
+
+# Run Python directly - no shell script
+CMD ["python3", "/trader_bot.py"]
