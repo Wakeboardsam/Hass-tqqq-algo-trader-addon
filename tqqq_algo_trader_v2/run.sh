@@ -1,5 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/with-contenv bashio
+set -e
+
+bashio::log.info "Starting TQQQ Algo Trader V2..."
 
 # Location for persistent data
 mkdir -p /data/tqqq-bot
@@ -14,6 +16,5 @@ export BOT_CONFIG="/data/tqqq-bot/config.yaml"
 export LEDGER_DB="/data/tqqq-bot/ledger_v2.db"
 export LOG_FILE="/data/tqqq-bot/bot.log"
 
-# Start the bot as PID 1
-echo "[INFO] Launching TQQQ Algo Trader V2..."
+# Run the bot (s6 will manage it as a service)
 exec python3 /trader_bot.py
