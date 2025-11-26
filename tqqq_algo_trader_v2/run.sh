@@ -16,4 +16,4 @@ export LEDGER_DB="/data/tqqq-bot/ledger_v2.db"
 export LOG_FILE="/data/tqqq-bot/bot.log"
 
 # Start
-python3 /app/trader_bot.py
+exec python3 /app/trader_bot.py
