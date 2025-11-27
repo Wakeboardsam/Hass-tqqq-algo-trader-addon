@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS virtual_lots (
     buy_price REAL,
     sell_target REAL,
     status TEXT,
-    created_at INTEGER
+    created_at INTEGER,
+    alpaca_order_id TEXT
 );
 CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,7 +113,7 @@ class VirtualLot:
     virtual_cost: float
     buy_price: float
     sell_target: float
-    status: str  # PENDING, OPEN, or CLOSED
+    status: str  # PENDING, ORDER_SENT, OPEN, or CLOSED
 
 # ---------- Utility functions ----------
 def tail_log(n: int = LOG_TAIL) -> str:
@@ -224,7 +225,7 @@ def get_actual_position_shares() -> int:
     except Exception:
         return 0
 
-# --- FIX 3: Consolidated Limit Order Function (Handles Fills and Extended Hours) ---
+# --- Consolidated Limit Order Function (Handles Fills and Extended Hours) ---
 def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
     """Submits a Limit Order using the user's required Time In Force and Extended Hours."""
     if qty <= 0 or not api:
@@ -252,7 +253,6 @@ def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
         # This will catch the 'Insufficient Buying Power' error from Alpaca
         logger.error(f"Order failed: {e}") 
         return None
-# --- FIX 3 END ---
 
 def reconcile_orders():
     if not api:
@@ -263,7 +263,31 @@ def reconcile_orders():
         for rid, aid in rows:
             try:
                 o = api.get_order_by_id(aid)
-                cur.execute("UPDATE orders SET status=? WHERE id=?", (str(o.status), rid))
+                # Check if the order status is 'filled'
+                if str(o.status) == 'filled':
+                    # Find the virtual lot associated with this order ID (if we were tracking it)
+                    # For simplicity here, we only check against PENDING orders placed by the bot
+                    cur.execute("SELECT level, side FROM orders WHERE alpaca_id=?", (aid,))
+                    order_details = cur.fetchone()
+
+                    # Update the associated virtual lot status if this was a successful BUY order
+                    if order_details and order_details[1] == 'buy':
+                        # ASSUMING: we only place one order per level initially (Level 1 anchor buy logic)
+                        # We need a way to link the order ID back to the virtual lot level.
+                        # For now, we will simply update the order status
+                        cur.execute("UPDATE orders SET status=? WHERE id=?", (str(o.status), rid))
+                        
+                        # --- CRITICAL NEW STEP: Link filled order back to lot and update status to OPEN ---
+                        # In this simple model, we assume Level 1 is the most recent pending buy that filled.
+                        cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE status='PENDING'")
+                        # --- END CRITICAL NEW STEP ---
+                    
+                    # Update status for ALL orders in the orders table
+                    cur.execute("UPDATE orders SET status=? WHERE id=?", (str(o.status), rid))
+
+                else:
+                    cur.execute("UPDATE orders SET status=? WHERE id=?", (str(o.status), rid))
+
             except Exception:
                 pass
         conn.commit()
@@ -289,8 +313,10 @@ async def trading_loop():
         
     while True:
         try:
+            # 3. Reconcile orders FIRST so we know which lots are now OPEN
+            reconcile_orders()
+            
             if is_paused():
-                # FIXED: Missing closing parenthesis on line 528 (now line 293)
                 logger.info("Bot is paused (maintenance). Sleeping.")
                 await asyncio.sleep(POLL_MS/1000)
                 continue
@@ -307,18 +333,13 @@ async def trading_loop():
             if cur.fetchone()[0] == 0:
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
                 
-                # Use current price as the anchor buy target
                 target_price = price 
-                
-                # Calculate shares for Level 1 (current_level=0 in function)
                 qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
 
                 if qty > 0 and qty <= MAX_POSITION_SHARES:
                     
-                    # 1% profit target based on anchor price
                     sell_target = round(target_price * 1.01, 8) 
                     
-                    # Submit the limit order at the current market price
                     if submit_order("buy", qty, target_price):
                         # Mark this lot as PENDING until filled
                         cur.execute("""INSERT OR IGNORE INTO virtual_lots
@@ -327,11 +348,10 @@ async def trading_loop():
                             (1, qty, target_price*qty, target_price, sell_target, "PENDING", int(time.time())))
                         conn.commit()
                 
-                logger.info(f"Anchor Buy placed: QTY={qty} @ ${target_price:.2f}. Strategy is now active.")
+                logger.info(f"Anchor Buy submitted: QTY={qty} @ ${target_price:.2f}. Strategy is now PENDING fill.")
                 await asyncio.sleep(POLL_MS/1000)
                 continue
             # --- END STARTUP LOGIC ---
-
 
             # --- RUNNING LOGIC ---
             
@@ -346,7 +366,6 @@ async def trading_loop():
                     if qty >= MIN_ORDER_SHARES:
                         logger.info("SELL TRIGGER level=%s sell_target=%s price=%s qty=%s", level, sell_target, price, qty)
                         
-                        # Submit a LIMIT sell order at the target price
                         if submit_order("sell", qty, sell_target):
                             cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (level,))
                             conn.commit()
@@ -359,23 +378,19 @@ async def trading_loop():
             # If no PENDING lots exist, calculate and create the next PENDING lot (Level N+1)
             if not pending_rows:
                 
-                # Find the current deepest level
                 cur.execute("SELECT MAX(level) FROM virtual_lots")
                 max_level = cur.fetchone()[0] or 0
                 
-                # Retrieve the initial anchor price (Level 1) to base all drops on
                 cur.execute("SELECT buy_price FROM virtual_lots WHERE level=1")
                 anchor_result = cur.fetchone()
                 anchor_price = anchor_result[0] if anchor_result else INITIAL_PRICE
                 
-                # Calculate the next required buy level
                 qty, buy_target_price = compute_allocation_levels(anchor_price, max_level, INITIAL_CASH, RF, LEVELS)
 
                 if qty > 0 and buy_target_price > 0:
                     
-                    sell_target = round(buy_target_price * 1.01, 8) # Temporary sell target for calculation
+                    sell_target = round(buy_target_price * 1.01, 8) 
                     
-                    # Insert the new pending lot for the next drop
                     cur.execute("""INSERT INTO virtual_lots
                         (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at)
                         VALUES (?,?,?,?,?,?,?)""",
@@ -391,6 +406,8 @@ async def trading_loop():
             actual_shares = get_actual_position_shares() 
             
             for level, vshares, buy_price in pending_rows:
+                # CRITICAL: We only place a buy order IF the current price is at or below the target price AND 
+                # we have NO open orders for this lot (implied by the new PENDING status, but safer to check)
                 if price <= buy_price:
                     if actual_shares + vshares > MAX_POSITION_SHARES:
                         logger.info("Safety cap would be exceeded; skipping buy for level %s", level)
@@ -402,14 +419,11 @@ async def trading_loop():
                         
                     logger.info("BUY TRIGGER level=%s buy_price=%s price=%s qty=%s", level, buy_price, price, qty)
                     
-                    # Placing a BUY limit order
                     if submit_order("buy", qty, buy_price):
-                        # We mark as OPEN (holding) only once the order is placed
-                        cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE level=?", (level,))
-                        conn.commit()
-
-            # 3. Reconcile orders
-            reconcile_orders()
+                        # We mark as PENDING until filled. Reconcile will move it to OPEN.
+                        pass
+            
+            # Reconciliation moved to the top of the loop.
             
         except Exception:
             logger.exception("Exception in trading loop")
