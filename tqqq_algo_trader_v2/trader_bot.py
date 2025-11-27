@@ -52,7 +52,7 @@ SYMBOL = cfg.get("symbol", "TQQQ")
 RF = float(cfg.get("reduction_factor", 0.95))
 LEVELS = int(cfg.get("levels", 88))
 INITIAL_CASH = float(cfg.get("initial_cash", 250000))
-INITIAL_PRICE = float(cfg.get("initial_price", 0.0)) 
+# Removed INITIAL_PRICE from options, so we rely solely on runtime price fetching
 POLL_MS = int(cfg.get("poll_interval_ms", 500))
 MIN_ORDER_SHARES = int(cfg.get("min_order_shares", 1))
 MAX_POSITION_SHARES = int(cfg.get("max_position_shares", 200000))
@@ -376,7 +376,8 @@ async def trading_loop():
                 target_price = price 
                 
                 # Aggressive Limit Price: Increase Limit Buy price slightly to guarantee execution
-                aggressive_limit_price = round(target_price + 0.05, 2)
+                # Reduced buffer from 0.05 to 0.01 for less aggressive fill attempt
+                aggressive_limit_price = round(target_price + 0.01, 2)
                 
                 # Calculate shares for Level 1 (current_level=0 in function)
                 qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
@@ -437,21 +438,23 @@ async def trading_loop():
                 
                 cur.execute("SELECT buy_price FROM virtual_lots WHERE level=1")
                 anchor_result = cur.fetchone()
-                anchor_price = anchor_result[0] if anchor_result else INITIAL_PRICE
+                # Ensure we use the actual buy price from Level 1, not INITIAL_PRICE
+                anchor_price = anchor_result[0] if anchor_result else 0.0 
                 
-                qty, buy_target_price = compute_allocation_levels(anchor_price, max_level, INITIAL_CASH, RF, LEVELS)
+                if anchor_price > 0:
+                    qty, buy_target_price = compute_allocation_levels(anchor_price, max_level, INITIAL_CASH, RF, LEVELS)
 
-                if qty > 0 and buy_target_price > 0:
-                    
-                    sell_target = round(buy_target_price * 1.01, 8) 
-                    
-                    cur.execute("""INSERT INTO virtual_lots
-                        (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at)
-                        VALUES (?,?,?,?,?,?,?)""",
-                        (max_level + 1, qty, buy_target_price*qty, buy_target_price, sell_target, "PENDING", int(time.time())))
-                    conn.commit()
-                    
-                    logger.info(f"Prepared next pending lot: Level {max_level + 1} @ ${buy_target_price:.2f}")
+                    if qty > 0 and buy_target_price > 0:
+                        
+                        sell_target = round(buy_target_price * 1.01, 8) 
+                        
+                        cur.execute("""INSERT INTO virtual_lots
+                            (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at)
+                            VALUES (?,?,?,?,?,?,?)""",
+                            (max_level + 1, qty, buy_target_price*qty, buy_target_price, sell_target, "PENDING", int(time.time())))
+                        conn.commit()
+                        
+                        logger.info(f"Prepared next pending lot: Level {max_level + 1} @ ${buy_target_price:.2f}")
 
             # Re-fetch PENDING rows now that the new one might be created
             cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING' ORDER BY level DESC")
@@ -583,7 +586,6 @@ def create_web_app():
     app.router.add_get('/', handle_index)
     app.router.add_get('/api/status', api_status)
     app.router.add_get('/api/levels', api_levels)
-    app.router.add_get('/api/logs', api_logs)
     app.router.add_post('/api/clear-logs', api_clear_logs)
     app.router.add_post('/api/clear-db', api_clear_db) # New routing endpoint
     app.router.add_post('/api/pause', api_pause)
