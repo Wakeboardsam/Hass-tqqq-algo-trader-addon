@@ -386,7 +386,7 @@ async def trading_loop():
                 target_price = price 
                 
                 # Aggressive Limit Price: Increase Limit Buy price slightly to guarantee execution
-                # Reduced buffer from 0.05 to 0.01 for less aggressive fill attempt
+                # FIX: Reduced buffer from 0.05 to 0.01 for less aggressive fill attempt
                 aggressive_limit_price = round(target_price + 0.01, 2)
                 
                 # Calculate shares for Level 1 (current_level=0 in function)
@@ -486,4 +486,149 @@ async def trading_loop():
                     
                     order_id = submit_order("buy", qty, buy_price)
                     if order_id:
-                        # CRITICAL: Mov
+                        # CRITICAL: Move lot to ORDER_SENT status immediately to prevent duplicate orders
+                        cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (order_id, level))
+                        conn.commit()
+            
+        except Exception:
+            logger.exception("Exception in trading loop")
+            
+        await asyncio.sleep(POLL_MS/1000)
+
+# ---------- Web UI (aiohttp) ----------
+async def handle_index(request):
+    price = get_latest_price()
+    pos = get_actual_position_shares()
+    cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='OPEN'")
+    r = cur.fetchone()
+    open_cost = r[0] if r and r[0] else 0.0
+    
+    cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='CLOSED'")
+    r = cur.fetchone()
+    closed_cost = r[0] if r and r[0] else 0.0
+    
+    # Get Reconciliation Status
+    reco_status = get_reconciliation_status()
+    reco_alert = ""
+    if not reco_status['reconciled']:
+        reco_alert = f"""<p style='color:red; font-weight:bold;'>WARNING: Share Mismatch! DB ({reco_status['assumed_shares']}) != Alpaca ({reco_status['actual_shares']})</p>"""
+    
+    html = f"""
+    <html>
+    <head><title>TQQQ Bot Status</title></head>
+    <body>
+      <h2>TQQQ Bot Status</h2>
+      {reco_alert}
+      <p>Symbol: {SYMBOL}</p>
+      <p>Current Price: {price}</p>
+      <p>Actual Position Shares (Alpaca): {pos}</p>
+      <p>Open Virtual Cost (sum): {open_cost:.2f}</p>
+      <p>Closed Virtual Cost (sum): {closed_cost:.2f}</p>
+      <p>Reduction Factor: {RF}</p>
+      <p>Levels configured: {LEVELS}</p>
+      <p><a href="/api/levels">View full levels (JSON)</a></p>
+      
+      <!-- Buttons for control and clearing -->
+      <form method="post" action="/api/clear-logs" style="display:inline;"><button type="submit">Clear Logs</button></form>
+      <form method="post" action="/api/clear-db" style="display:inline;"><button type="submit">Clear Database (DANGER!)</button></form>
+      <form method="post" action="/api/pause" style="display:inline;"><button type="submit">Pause Bot</button></form>
+      <form method="post" action="/api/resume" style="display:inline;"><button type="submit">Resume Bot</button></form>
+      
+      <h3>Reconciliation Data</h3>
+      <ul>
+        <li>Shares Delta (Actual - Assumed): {reco_status['shares_delta']}</li>
+        <li>Account Buying Power: ${reco_status['alpaca_cash']:.2f}</li>
+      </ul>
+      
+      <h3>Recent logs</h3>
+      <pre>{tail_log(200)}</pre>
+    </body>
+    </html>
+    """
+    return web.Response(text=html, content_type='text/html')
+
+# --- NEW API Endpoint: Clear Database ---
+async def api_clear_db(request):
+    clear_db()
+    raise web.HTTPFound('/')
+# --- END NEW API Endpoint ---
+
+async def api_status(request):
+    price = get_latest_price()
+    pos = get_actual_position_shares()
+    cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='OPEN'")
+    open_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='CLOSED'")
+    closed_count = cur.fetchone()[0]
+    data = {
+        "symbol": SYMBOL,
+        "price": price,
+        "position_shares": pos,
+        "open_virtual_lots": open_count,
+        "closed_virtual_lots": closed_count,
+        "reduction_factor": RF,
+        "paused": is_paused()
+    }
+    return web.json_response(data)
+
+async def api_levels(request):
+    cur.execute("SELECT level, virtual_shares, virtual_cost, buy_price, sell_target, status FROM virtual_lots ORDER BY level")
+    rows = cur.fetchall()
+    levels = []
+    for r in rows:
+        levels.append({
+            "level": r[0],
+            "virtual_shares": r[1],
+            "virtual_cost": r[2],
+            "buy_price": r[3],
+            "sell_target": r[4],
+            "status": r[5]
+        })
+    return web.json_response({"levels": levels})
+
+async def api_logs(request):
+    return web.Response(text=tail_log(LOG_TAIL), content_type='text/plain')
+
+async def api_clear_logs(request):
+    clear_log()
+    raise web.HTTPFound('/')
+
+async def api_pause(request):
+    set_paused(True)
+    raise web.HTTPFound('/')
+
+async def api_resume(request):
+    set_paused(False)
+    raise web.HTTPFound('/')
+
+def create_web_app():
+    app = web.Application()
+    app.router.add_get('/', handle_index)
+    app.router.add_get('/api/status', api_status)
+    app.router.add_get('/api/levels', api_levels)
+    app.router.add_post('/api/clear-logs', api_clear_logs)
+    app.router.add_post('/api/clear-db', api_clear_db) # New routing endpoint
+    app.router.add_post('/api/pause', api_pause)
+    app.router.add_post('/api/resume', api_resume)
+    return app
+
+# ---------- Main ----------
+async def main():
+    logger.info("Starting TQQQ bot v2 (alpaca-py)")
+    
+    loop = asyncio.get_event_loop()
+    app = create_web_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', WEBUI_PORT)
+    await site.start()
+    logger.info(f"Web UI listening on port {WEBUI_PORT}")
+
+    await trading_loop()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down bot")
+
