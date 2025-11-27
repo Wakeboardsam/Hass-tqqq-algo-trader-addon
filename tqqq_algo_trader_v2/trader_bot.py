@@ -133,21 +133,24 @@ def clear_log():
         logger.exception("Failed clearing log")
         return False
 
-# --- NEW FUNCTION: Clear the Database ---
+# --- FINAL FIX: Clear Database and Schema Reset ---
 def clear_db():
     try:
+        # Drop tables first to force a schema recreation
         cur.executescript("""
-            DELETE FROM virtual_lots;
-            DELETE FROM orders;
-            DELETE FROM meta;
+            DROP TABLE IF EXISTS virtual_lots;
+            DROP TABLE IF EXISTS orders;
+            DROP TABLE IF EXISTS meta;
         """)
         conn.commit()
-        logger.info("Database (virtual_lots, orders, meta) cleared via web UI.")
+        # The next time the bot starts, the tables will be recreated with the correct columns.
+        logger.info("Database (virtual_lots, orders, meta) DROPPED and cleared via web UI. Restart required.")
         return True
     except Exception as e:
         logger.exception("Failed clearing database")
         return False
-# --- END NEW FUNCTION ---
+# --- END FINAL FIX ---
+
 
 def write_meta(key: str, val: str):
     cur.execute("INSERT OR REPLACE INTO meta (key,val) VALUES (?,?)", (key, val))
@@ -307,6 +310,33 @@ async def trading_loop():
     logger.info("Starting trading loop")
     
     try:
+        # This will recreate tables if they were dropped by clear_db
+        cur.executescript("""
+            CREATE TABLE IF NOT EXISTS virtual_lots (
+                level INTEGER PRIMARY KEY,
+                virtual_shares INTEGER,
+                virtual_cost REAL,
+                buy_price REAL,
+                sell_target REAL,
+                status TEXT,
+                created_at INTEGER,
+                alpaca_order_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alpaca_id TEXT,
+                side TEXT,
+                qty INTEGER,
+                price REAL,
+                status TEXT,
+                created_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                val TEXT
+            );
+        """)
+        conn.commit()
         seed_virtual_ledger_if_empty()
     except Exception as e:
         logger.critical(f"Failed to seed ledger: {e}")
@@ -333,12 +363,10 @@ async def trading_loop():
             if cur.fetchone()[0] == 0:
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
                 
-                # Use the CURRENT PRICE to set the limit price for an IMMEDIATE fill
+                # Use the CURRENT PRICE to set the anchor price
                 target_price = price 
                 
-                # Increase Limit Buy price slightly to guarantee execution (marketable limit)
-                # Adding a small buffer (e.g., 0.05) to the price for a buy order
-                # This ensures the limit order is aggressive enough to hit the current ask.
+                # Aggressive Limit Price: Increase Limit Buy price slightly to guarantee execution
                 aggressive_limit_price = round(target_price + 0.05, 2)
                 
                 # Calculate shares for Level 1 (current_level=0 in function)
