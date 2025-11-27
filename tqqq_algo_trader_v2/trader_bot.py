@@ -13,7 +13,7 @@ from aiohttp import web
 
 # ---------- Alpaca-py Imports (UPDATED) ----------
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, OrderRequest
+from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
@@ -258,6 +258,7 @@ def reconcile_orders():
     if not api:
         return
     try:
+        # Check all orders not yet finalized
         cur.execute("SELECT id, alpaca_id FROM orders WHERE status NOT IN ('filled','canceled','expired')")
         rows = cur.fetchall()
         for rid, aid in rows:
@@ -265,32 +266,27 @@ def reconcile_orders():
                 o = api.get_order_by_id(aid)
                 order_status = str(o.status)
 
-                # Check if the order status is 'filled'
-                if order_status == 'filled':
-                    # We need to find the virtual lot that corresponds to this filled order.
-                    # Since we don't have a direct link in the DB, we assume the latest PENDING buy fills first.
-                    
-                    # Update status for ALL orders in the orders table
-                    cur.execute("UPDATE orders SET status=? WHERE id=?", (order_status, rid))
+                # Find the virtual lot associated with this order ID
+                cur.execute("SELECT level FROM virtual_lots WHERE alpaca_order_id=?", (aid,))
+                lot_level_result = cur.fetchone()
+                lot_level = lot_level_result[0] if lot_level_result else None
 
-                    # --- CRITICAL NEW STEP: Update the associated virtual lot status ---
-                    cur.execute("SELECT level FROM virtual_lots WHERE status='ORDER_SENT' ORDER BY level ASC LIMIT 1")
-                    pending_lot = cur.fetchone()
+                # 1. Update the orders table status
+                cur.execute("UPDATE orders SET status=? WHERE id=?", (order_status, rid))
 
-                    if pending_lot and o.side == OrderSide.BUY:
-                        # Move the lot from ORDER_SENT to OPEN (Holding)
-                        cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE level=?", (pending_lot[0],))
-                        logger.info(f"Lot Level {pending_lot[0]} moved to OPEN (Filled).")
+                # 2. Update virtual_lots status if the order is filled
+                if order_status == 'filled' and lot_level is not None:
+                    cur.execute("SELECT side FROM orders WHERE alpaca_id=?", (aid,))
+                    order_side = cur.fetchone()
                     
-                    # Also move any associated 'PENDING' lot to 'OPEN' if it hasn't been set to ORDER_SENT
-                    # We assume any filled buy means the strategy needs to update its position
-                    cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE status='PENDING'")
-                    # --- END CRITICAL NEW STEP ---
-                
-                # If the order is still active but not filled, we don't change anything yet.
-                # If the order is accepted/new, we update the orders table status.
-                else:
-                    cur.execute("UPDATE orders SET status=? WHERE id=?", (order_status, rid))
+                    if order_side and order_side[0] == 'buy':
+                        # If the buy order filled, the lot is now OPEN (holding)
+                        cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE level=?", (lot_level,))
+                        logger.info(f"Lot Level {lot_level} moved to OPEN (Filled).")
+                    elif order_side and order_side[0] == 'sell':
+                        # If the sell order filled, the lot is now CLOSED (sold)
+                        cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (lot_level,))
+                        logger.info(f"Lot Level {lot_level} moved to CLOSED (Sold).")
 
             except Exception:
                 pass
@@ -337,23 +333,33 @@ async def trading_loop():
             if cur.fetchone()[0] == 0:
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
                 
+                # Use the CURRENT PRICE to set the limit price for an IMMEDIATE fill
                 target_price = price 
+                
+                # Increase Limit Buy price slightly to guarantee execution (marketable limit)
+                # Adding a small buffer (e.g., 0.05) to the price for a buy order
+                # This ensures the limit order is aggressive enough to hit the current ask.
+                aggressive_limit_price = round(target_price + 0.05, 2)
+                
+                # Calculate shares for Level 1 (current_level=0 in function)
                 qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
 
                 if qty > 0 and qty <= MAX_POSITION_SHARES:
                     
                     sell_target = round(target_price * 1.01, 8) 
                     
-                    order_id = submit_order("buy", qty, target_price)
+                    # Submit the limit order at the AGGRESSIVE PRICE
+                    order_id = submit_order("buy", qty, aggressive_limit_price)
+                    
                     if order_id:
-                        # Mark this lot as ORDER_SENT (Order has been placed, waiting for fill)
+                        # Mark this lot as ORDER_SENT (Order placed, waiting for fill)
                         cur.execute("""INSERT OR IGNORE INTO virtual_lots
                             (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at, alpaca_order_id)
                             VALUES (?,?,?,?,?,?,?,?)""",
                             (1, qty, target_price*qty, target_price, sell_target, "ORDER_SENT", int(time.time()), order_id))
                         conn.commit()
                 
-                logger.info(f"Anchor Buy submitted: QTY={qty} @ ${target_price:.2f}. Strategy is now PENDING fill.")
+                logger.info(f"Anchor Buy submitted: QTY={qty} @ ${aggressive_limit_price:.2f} (Aggressive Limit). Strategy is now PENDING fill.")
                 await asyncio.sleep(POLL_MS/1000)
                 continue
             # --- END STARTUP LOGIC ---
@@ -371,8 +377,11 @@ async def trading_loop():
                     if qty >= MIN_ORDER_SHARES:
                         logger.info("SELL TRIGGER level=%s sell_target=%s price=%s qty=%s", level, sell_target, price, qty)
                         
-                        if submit_order("sell", qty, sell_target):
-                            cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (level,))
+                        # Submit a LIMIT sell order at the target price
+                        order_id = submit_order("sell", qty, sell_target)
+                        if order_id:
+                            # Mark as ORDER_SENT (waiting for fill)
+                            cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (order_id, level))
                             conn.commit()
 
             # 2. BUY logic: Check all lots waiting to be bought ('PENDING')
