@@ -14,7 +14,7 @@ from aiohttp import web
 # ---------- Alpaca-py Imports (UPDATED) ----------
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, OrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -43,7 +43,6 @@ except Exception:
     cfg = {}
 
 # --- FIX 1: Prioritize Environment Variables for API Keys ---
-# This resolves the "Alpaca credentials not found" warning.
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY") 
 ALPACA_API_SECRET = os.environ.get("ALPACA_SECRET_KEY")
 USE_PAPER = cfg.get("alpaca", {}).get("use_paper", True)
@@ -53,7 +52,6 @@ SYMBOL = cfg.get("symbol", "TQQQ")
 RF = float(cfg.get("reduction_factor", 0.95))
 LEVELS = int(cfg.get("levels", 88))
 INITIAL_CASH = float(cfg.get("initial_cash", 250000))
-# NOTE: INITIAL_PRICE is now ignored for dynamic startup
 INITIAL_PRICE = float(cfg.get("initial_price", 0.0)) 
 POLL_MS = int(cfg.get("poll_interval_ms", 500))
 MIN_ORDER_SHARES = int(cfg.get("min_order_shares", 1))
@@ -134,6 +132,22 @@ def clear_log():
         logger.exception("Failed clearing log")
         return False
 
+# --- NEW FUNCTION: Clear the Database ---
+def clear_db():
+    try:
+        cur.executescript("""
+            DELETE FROM virtual_lots;
+            DELETE FROM orders;
+            DELETE FROM meta;
+        """)
+        conn.commit()
+        logger.info("Database (virtual_lots, orders, meta) cleared via web UI.")
+        return True
+    except Exception as e:
+        logger.exception("Failed clearing database")
+        return False
+# --- END NEW FUNCTION ---
+
 def write_meta(key: str, val: str):
     cur.execute("INSERT OR REPLACE INTO meta (key,val) VALUES (?,?)", (key, val))
     conn.commit()
@@ -157,7 +171,7 @@ def compute_allocation_levels(anchor_price: float, current_level: int, starting_
     # Calculate allocation for the next level's index
     alloc_cash = starting_cash * base_alloc_factor * (rf ** current_level) 
     
-    # Calculate the price for the next level (1% step based on anchor price)
+    # Calculate the price for the next level (1% step down)
     step_down_percent = 0.01 
     buy_price = round(anchor_price * (1 - (next_level * step_down_percent)), 8)
 
@@ -165,15 +179,11 @@ def compute_allocation_levels(anchor_price: float, current_level: int, starting_
     
     return shares, buy_price
 
-# --- FIX 2: Dynamic Seeding & Initial Buy Logic ---
-# Original seed logic is removed. We now handle the initial buy dynamically.
-
 def seed_virtual_ledger_if_empty():
-    """Only ensures the meta table is ready. The initial buy is handled in the trading loop."""
+    """Ensures the meta table is ready. The initial buy is handled in the trading loop."""
     cur.execute("SELECT COUNT(1) FROM virtual_lots")
     if cur.fetchone()[0] == 0:
         logger.info("Ledger is empty. Ready for initial buy sequence.")
-        # No initial seeding; trading loop handles Level 1 purchase.
         
 def load_open_virtual_lots() -> List[VirtualLot]:
     cur.execute("SELECT level, virtual_shares, virtual_cost, buy_price, sell_target, status FROM virtual_lots WHERE status='OPEN' ORDER BY level")
@@ -214,7 +224,7 @@ def get_actual_position_shares() -> int:
     except Exception:
         return 0
 
-# --- FIX 3: Consolidated Limit Order Function ---
+# --- FIX 3: Consolidated Limit Order Function (Handles Fills and Extended Hours) ---
 def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
     """Submits a Limit Order using the user's required Time In Force and Extended Hours."""
     if qty <= 0 or not api:
@@ -247,7 +257,6 @@ def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
 def reconcile_orders():
     if not api:
         return
-    # Logic remains the same (fetching status and updating DB)
     try:
         cur.execute("SELECT id, alpaca_id FROM orders WHERE status NOT IN ('filled','canceled','expired')")
         rows = cur.fetchall()
@@ -281,7 +290,7 @@ async def trading_loop():
     while True:
         try:
             if is_paused():
-                logger.info("Bot is paused (maintenance). Sleeping.")
+                logger.info("Bot is paused (maintenance). Sleeping.)
                 await asyncio.sleep(POLL_MS/1000)
                 continue
 
@@ -292,7 +301,7 @@ async def trading_loop():
 
             actual_shares = get_actual_position_shares()
             
-            # --- STARTUP LOGIC ---
+            # --- STARTUP LOGIC: Place Level 1 Anchor Buy ---
             cur.execute("SELECT COUNT(1) FROM virtual_lots")
             if cur.fetchone()[0] == 0:
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
@@ -305,8 +314,10 @@ async def trading_loop():
 
                 if qty > 0 and qty <= MAX_POSITION_SHARES:
                     
-                    sell_target = round(target_price * 1.01, 8) # 1% above anchor price
+                    # 1% profit target based on anchor price
+                    sell_target = round(target_price * 1.01, 8) 
                     
+                    # Submit the limit order at the current market price
                     if submit_order("buy", qty, target_price):
                         # Mark this lot as PENDING until filled
                         cur.execute("""INSERT OR IGNORE INTO virtual_lots
@@ -334,7 +345,7 @@ async def trading_loop():
                     if qty >= MIN_ORDER_SHARES:
                         logger.info("SELL TRIGGER level=%s sell_target=%s price=%s qty=%s", level, sell_target, price, qty)
                         
-                        # We use submit_order (which is now limit order)
+                        # Submit a LIMIT sell order at the target price
                         if submit_order("sell", qty, sell_target):
                             cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (level,))
                             conn.commit()
@@ -343,13 +354,15 @@ async def trading_loop():
             cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING' ORDER BY level DESC")
             pending_rows = cur.fetchall()
             
-            # If no pending lots, we need to calculate the next drop target (Level N+1)
+            
+            # If no PENDING lots exist, calculate and create the next PENDING lot (Level N+1)
             if not pending_rows:
-                # Find the deepest level currently recorded (OPEN or CLOSED)
-                cur.execute("SELECT MAX(level), buy_price FROM virtual_lots")
-                max_level, anchor_price = cur.fetchone()
                 
-                # Check if we have an anchor price (Level 1 buy_price)
+                # Find the current deepest level
+                cur.execute("SELECT MAX(level) FROM virtual_lots")
+                max_level = cur.fetchone()[0] or 0
+                
+                # Retrieve the initial anchor price (Level 1) to base all drops on
                 cur.execute("SELECT buy_price FROM virtual_lots WHERE level=1")
                 anchor_result = cur.fetchone()
                 anchor_price = anchor_result[0] if anchor_result else INITIAL_PRICE
@@ -358,19 +371,22 @@ async def trading_loop():
                 qty, buy_target_price = compute_allocation_levels(anchor_price, max_level, INITIAL_CASH, RF, LEVELS)
 
                 if qty > 0 and buy_target_price > 0:
-                    # Insert the new pending lot for the next drop
-                    sell_target = round(anchor_price * 1.01, 8) # Using 1% above anchor price as sell target base (simplification)
                     
+                    sell_target = round(buy_target_price * 1.01, 8) # Temporary sell target for calculation
+                    
+                    # Insert the new pending lot for the next drop
                     cur.execute("""INSERT INTO virtual_lots
                         (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at)
                         VALUES (?,?,?,?,?,?,?)""",
                         (max_level + 1, qty, buy_target_price*qty, buy_target_price, sell_target, "PENDING", int(time.time())))
                     conn.commit()
-                    pending_rows = [(max_level + 1, qty, buy_target_price)]
+                    
                     logger.info(f"Prepared next pending lot: Level {max_level + 1} @ ${buy_target_price:.2f}")
 
+            # Re-fetch PENDING rows now that the new one might be created
+            cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING' ORDER BY level DESC")
+            pending_rows = cur.fetchall()
 
-            # Process PENDING lots (newly created or waiting from earlier)
             actual_shares = get_actual_position_shares() 
             
             for level, vshares, buy_price in pending_rows:
@@ -400,7 +416,7 @@ async def trading_loop():
         await asyncio.sleep(POLL_MS/1000)
 
 # ---------- Web UI (aiohttp) ----------
-# (All Web UI functions remain correct and unchanged, as they only read the DB)
+# The Web UI functions are updated to include the DB clear button functionality
 
 async def handle_index(request):
     price = get_latest_price()
@@ -426,15 +442,25 @@ async def handle_index(request):
       <p>Reduction Factor: {RF}</p>
       <p>Levels configured: {LEVELS}</p>
       <p><a href="/api/levels">View full levels (JSON)</a></p>
-      <form method="post" action="/api/clear-logs"><button type="submit">Clear logs</button></form>
-      <form method="post" action="/api/pause"><button type="submit">Pause bot</button></form>
-      <form method="post" action="/api/resume"><button type="submit">Resume bot</button></form>
+      
+      <!-- Buttons for control and clearing -->
+      <form method="post" action="/api/clear-logs" style="display:inline;"><button type="submit">Clear Logs</button></form>
+      <form method="post" action="/api/clear-db" style="display:inline;"><button type="submit">Clear Database (DANGER!)</button></form>
+      <form method="post" action="/api/pause" style="display:inline;"><button type="submit">Pause Bot</button></form>
+      <form method="post" action="/api/resume" style="display:inline;"><button type="submit">Resume Bot</button></form>
+      
       <h3>Recent logs</h3>
       <pre>{tail_log(200)}</pre>
     </body>
     </html>
     """
     return web.Response(text=html, content_type='text/html')
+
+# --- NEW API Endpoint: Clear Database ---
+async def api_clear_db(request):
+    clear_db()
+    raise web.HTTPFound('/')
+# --- END NEW API Endpoint ---
 
 async def api_status(request):
     price = get_latest_price()
@@ -491,6 +517,7 @@ def create_web_app():
     app.router.add_get('/api/levels', api_levels)
     app.router.add_get('/api/logs', api_logs)
     app.router.add_post('/api/clear-logs', api_clear_logs)
+    app.router.add_post('/api/clear-db', api_clear_db) # New routing endpoint
     app.router.add_post('/api/pause', api_pause)
     app.router.add_post('/api/resume', api_resume)
     return app
@@ -499,18 +526,4 @@ def create_web_app():
 async def main():
     logger.info("Starting TQQQ bot v2 (alpaca-py)")
     
-    loop = asyncio.get_event_loop()
-    app = create_web_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', WEBUI_PORT)
-    await site.start()
-    logger.info(f"Web UI listening on port {WEBUI_PORT}")
-
-    await trading_loop()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Shutting down bot")
+    loop = a
