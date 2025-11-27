@@ -76,9 +76,10 @@ else:
     logger.warning("Alpaca credentials not found. API features disabled.")
 
 
-# ---------- SQLite ledger setup ----------
+# ---------- SQLite ledger setup (CRITICAL FIX: Schema Creation Moved Back) ----------
 conn = sqlite3.connect(LEDGER_DB, check_same_thread=False)
 cur = conn.cursor()
+# FIX: Ensure tables exist right after connecting, before any read/write operation
 cur.executescript("""
 CREATE TABLE IF NOT EXISTS virtual_lots (
     level INTEGER PRIMARY KEY,
@@ -105,6 +106,7 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """)
 conn.commit()
+
 
 @dataclass
 class VirtualLot:
@@ -133,23 +135,22 @@ def clear_log():
         logger.exception("Failed clearing log")
         return False
 
-# --- FINAL FIX: Clear Database and Schema Reset ---
+# --- Clear Database and Schema Reset ---
 def clear_db():
     try:
-        # Drop tables first to force a schema recreation
+        # Drop tables first to force a schema recreation upon next loop start
         cur.executescript("""
             DROP TABLE IF EXISTS virtual_lots;
             DROP TABLE IF EXISTS orders;
             DROP TABLE IF EXISTS meta;
         """)
         conn.commit()
-        # The next time the bot starts, the tables will be recreated with the correct columns.
+        # The next time the bot starts, the tables will be recreated with the correct columns due to the main setup block.
         logger.info("Database (virtual_lots, orders, meta) DROPPED and cleared via web UI. Restart required.")
         return True
     except Exception as e:
         logger.exception("Failed clearing database")
         return False
-# --- END FINAL FIX ---
 
 
 def write_meta(key: str, val: str):
@@ -184,7 +185,7 @@ def compute_allocation_levels(anchor_price: float, current_level: int, starting_
     return shares, buy_price
 
 def seed_virtual_ledger_if_empty():
-    """Ensures the meta table is ready. The initial buy is handled in the trading loop."""
+    """Checks if virtual_lots table has any data."""
     cur.execute("SELECT COUNT(1) FROM virtual_lots")
     if cur.fetchone()[0] == 0:
         logger.info("Ledger is empty. Ready for initial buy sequence.")
@@ -300,7 +301,14 @@ def reconcile_orders():
 # ---------- Safety / Maintenance ----------
 def is_paused() -> bool:
     v = read_meta("paused")
-    return v == "1"
+    # CRITICAL FIX: Need to check if meta table exists before reading
+    try:
+        # Quick check for table existence (prevents crash on first run)
+        cur.execute("SELECT 1 FROM meta LIMIT 1")
+        v = read_meta("paused")
+        return v == "1"
+    except sqlite3.OperationalError:
+        return False # Assume not paused if meta table doesn't exist
 
 def set_paused(val: bool):
     write_meta("paused", "1" if val else "0")
@@ -309,8 +317,9 @@ def set_paused(val: bool):
 async def trading_loop():
     logger.info("Starting trading loop")
     
+    # Run setup again here to ensure DB is ready if needed, and seed logic runs
     try:
-        # This will recreate tables if they were dropped by clear_db
+        # Re-run schema creation at startup of trading loop (Moved from main)
         cur.executescript("""
             CREATE TABLE IF NOT EXISTS virtual_lots (
                 level INTEGER PRIMARY KEY,
