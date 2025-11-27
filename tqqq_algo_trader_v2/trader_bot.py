@@ -13,8 +13,8 @@ from aiohttp import web
 
 # ---------- Alpaca-py Imports (UPDATED) ----------
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, OrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -42,21 +42,19 @@ except Exception:
     logger.exception("Error loading config file")
     cfg = {}
 
-# --- FIX START: Prioritize Environment Variables for API Keys ---
-# The environment variables (set by run.sh) are the authoritative source.
-# We no longer fall back to config.yaml for keys, as config.yaml defaults to empty.
+# --- FIX 1: Prioritize Environment Variables for API Keys ---
+# This resolves the "Alpaca credentials not found" warning.
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY") 
 ALPACA_API_SECRET = os.environ.get("ALPACA_SECRET_KEY")
-# --- FIX END ---
-
 USE_PAPER = cfg.get("alpaca", {}).get("use_paper", True)
-# Note: ALPACA_BASE is no longer required for alpaca-py client initialization
+# --- FIX 1 END ---
 
 SYMBOL = cfg.get("symbol", "TQQQ")
 RF = float(cfg.get("reduction_factor", 0.95))
 LEVELS = int(cfg.get("levels", 88))
 INITIAL_CASH = float(cfg.get("initial_cash", 250000))
-INITIAL_PRICE = float(cfg.get("initial_price", 0.0))
+# NOTE: INITIAL_PRICE is now ignored for dynamic startup
+INITIAL_PRICE = float(cfg.get("initial_price", 0.0)) 
 POLL_MS = int(cfg.get("poll_interval_ms", 500))
 MIN_ORDER_SHARES = int(cfg.get("min_order_shares", 1))
 MAX_POSITION_SHARES = int(cfg.get("max_position_shares", 200000))
@@ -67,12 +65,9 @@ LOG_TAIL = int(cfg.get("log_tail_lines", 200))
 api: Optional[TradingClient] = None
 data_api: Optional[StockHistoricalDataClient] = None
 
-# This check is now robust because ALPACA_API_KEY and ALPACA_SECRET_KEY contain the values from run.sh
 if ALPACA_API_KEY and ALPACA_API_SECRET:
     try:
-        # Trading Client (for orders and positions)
         api = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=USE_PAPER)
-        # Data Client (for price fetching)
         data_api = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
         logger.info(f"Alpaca clients initialized (Paper: {USE_PAPER})")
     except Exception as e:
@@ -149,56 +144,38 @@ def read_meta(key: str) -> Optional[str]:
     return r[0] if r else None
 
 # ---------- Reduction-factor allocation ----------
-def compute_allocation_levels(initial_price: float, starting_cash: float, rf: float, levels: int):
-    step = round(initial_price * 0.01, 8)  # 1% step based on initial price
-    denom = (1 - (rf ** levels)) if rf != 1.0 else levels
+def compute_allocation_levels(anchor_price: float, current_level: int, starting_cash: float, rf: float, total_levels: int) -> tuple[int, float]:
+    """Calculates the shares and cost for the NEXT required level (current_level + 1)."""
+    next_level = current_level + 1
+    if next_level > total_levels:
+        return 0, 0.0
+
+    # Total allocation factor denominator
+    denom = (1 - (rf ** total_levels)) if rf != 1.0 else total_levels
     base_alloc_factor = (1 - rf) / denom
-    allocations = []
-    for i in range(levels):
-        alloc = starting_cash * base_alloc_factor * (rf ** i)
-        buy_price = round(initial_price - i * step, 8)
-        allocations.append({"level": i+1, "buy_price": buy_price, "alloc_cash": alloc})
-    return allocations
+    
+    # Calculate allocation for the next level's index
+    alloc_cash = starting_cash * base_alloc_factor * (rf ** current_level) 
+    
+    # Calculate the price for the next level (1% step based on anchor price)
+    step_down_percent = 0.01 
+    buy_price = round(anchor_price * (1 - (next_level * step_down_percent)), 8)
 
-# Logic updated to use 'PENDING' status for safe initialization
+    shares = max(MIN_ORDER_SHARES, int(alloc_cash // buy_price))
+    
+    return shares, buy_price
+
+# --- FIX 2: Dynamic Seeding & Initial Buy Logic ---
+# Original seed logic is removed. We now handle the initial buy dynamically.
+
 def seed_virtual_ledger_if_empty():
+    """Only ensures the meta table is ready. The initial buy is handled in the trading loop."""
     cur.execute("SELECT COUNT(1) FROM virtual_lots")
-    if cur.fetchone()[0] > 0:
-        return
-    
-    p = INITIAL_PRICE
-    if (not p or p <= 0) and data_api:
-        try:
-            # Fetch latest 1 minute bar as fallback for current price
-            req = StockBarsRequest(
-                symbol_or_symbols=[SYMBOL],
-                timeframe=TimeFrame.Minute,
-                limit=1
-            )
-            bars = data_api.get_stock_bars(req)
-            if bars and SYMBOL in bars and len(bars[SYMBOL]) > 0:
-                 p = bars[SYMBOL][0].close
-        except Exception:
-            logger.exception("Failed to fetch market price to seed; using configured initial_price if set")
-
-    if not p or p <= 0:
-        raise RuntimeError("No initial price available to seed ledger. Set initial_price in config or ensure Alpaca keys are configured.")
-    
-    logger.info(f"Seeding virtual ledger at initial price {p}")
-    allocs = compute_allocation_levels(p, INITIAL_CASH, RF, LEVELS)
-    for a in allocs:
-        shares = max(MIN_ORDER_SHARES, int(a["alloc_cash"] // a["buy_price"]))
-        sell_target = round(a["buy_price"] + (p * 0.01), 8)  # profit = 1% of initial price
+    if cur.fetchone()[0] == 0:
+        logger.info("Ledger is empty. Ready for initial buy sequence.")
+        # No initial seeding; trading loop handles Level 1 purchase.
         
-        # New lots are marked 'PENDING' until the buy price is hit
-        cur.execute("""INSERT OR IGNORE INTO virtual_lots
-            (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at)
-            VALUES (?,?,?,?,?,?,?)""",
-            (a["level"], shares, a["buy_price"]*shares, a["buy_price"], sell_target, "PENDING", int(time.time())))
-    conn.commit()
-
 def load_open_virtual_lots() -> List[VirtualLot]:
-    # Changed to load only OPEN lots (those currently held)
     cur.execute("SELECT level, virtual_shares, virtual_cost, buy_price, sell_target, status FROM virtual_lots WHERE status='OPEN' ORDER BY level")
     return [VirtualLot(*r) for r in cur.fetchall()]
 
@@ -207,13 +184,12 @@ def get_latest_price() -> Optional[float]:
     if not data_api:
         return None
     try:
-        # Latest Trade
+        # Use latest trade price for accuracy
         req = StockLatestTradeRequest(symbol_or_symbols=[SYMBOL])
         trade = data_api.get_stock_latest_trade(req)
-        # The result is a dictionary mapping symbol to trade object
         return float(trade[SYMBOL].price)
     except Exception:
-        pass # Fallback to bars
+        logger.warning("Failed to fetch latest trade price. Falling back to bar close.")
 
     try:
         # Fallback: minute bar
@@ -226,56 +202,33 @@ def get_latest_price() -> Optional[float]:
         if bars and SYMBOL in bars and len(bars[SYMBOL]) > 0:
              return float(bars[SYMBOL][0].close)
     except Exception:
-        logger.exception("Price fetch failed")
+        logger.exception("Final price fetch failed")
     return None
 
 def get_actual_position_shares() -> int:
     if not api:
         return 0
     try:
-        # get_open_position raises a 404 exception if no position exists.
         p = api.get_open_position(SYMBOL)
         return int(float(p.qty))
     except Exception:
         return 0
 
-def place_market_order(side_str: str, qty: int) -> Optional[str]:
+# --- FIX 3: Consolidated Limit Order Function ---
+def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
+    """Submits a Limit Order using the user's required Time In Force and Extended Hours."""
     if qty <= 0 or not api:
         return None
     
     side = OrderSide.BUY if side_str.lower() == 'buy' else OrderSide.SELL
     
-    req = MarketOrderRequest(
-        symbol=SYMBOL,
-        qty=qty,
-        side=side,
-        time_in_force=TimeInForce.DAY
-    )
-
-    try:
-        order = api.submit_order(order_data=req)
-        cur.execute("INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) VALUES (?,?,?,?,?,?)",
-                    (str(order.id), side_str, qty, 0.0, str(order.status), int(time.time())))
-        conn.commit()
-        logger.info(f"Placed market {side_str} order qty={qty}")
-        return str(order.id)
-    except Exception as e:
-        logger.exception(f"Market order failed: {e}")
-        return None
-
-def place_limit_order(side_str: str, qty: int, price: float) -> Optional[str]:
-    # This function is not used in the original trading loop, but is updated for completeness.
-    if qty <= 0 or not api:
-        return None
-
-    side = OrderSide.BUY if side_str.lower() == 'buy' else OrderSide.SELL
-
     req = LimitOrderRequest(
         symbol=SYMBOL,
         qty=qty,
         side=side,
+        limit_price=round(price, 2), # Price must be rounded for Alpaca API
         time_in_force=TimeInForce.DAY,
-        limit_price=price
+        extended_hours=True # User requested Extended Hours for reliable fills
     )
 
     try:
@@ -283,21 +236,23 @@ def place_limit_order(side_str: str, qty: int, price: float) -> Optional[str]:
         cur.execute("INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) VALUES (?,?,?,?,?,?)",
                     (str(order.id), side_str, qty, price, str(order.status), int(time.time())))
         conn.commit()
-        logger.info(f"Placed limit {side_str} order qty={qty} @ {price}")
+        logger.info(f"Submitted LIMIT {side_str} order qty={qty} @ ${price:.2f}")
         return str(order.id)
-    except Exception:
-        logger.exception("Limit order failed")
+    except Exception as e:
+        # This will catch the 'Insufficient Buying Power' error from Alpaca
+        logger.error(f"Order failed: {e}") 
         return None
+# --- FIX 3 END ---
 
 def reconcile_orders():
     if not api:
         return
+    # Logic remains the same (fetching status and updating DB)
     try:
         cur.execute("SELECT id, alpaca_id FROM orders WHERE status NOT IN ('filled','canceled','expired')")
         rows = cur.fetchall()
         for rid, aid in rows:
             try:
-                # get_order_by_id is used in alpaca-py
                 o = api.get_order_by_id(aid)
                 cur.execute("UPDATE orders SET status=? WHERE id=?", (str(o.status), rid))
             except Exception:
@@ -322,8 +277,7 @@ async def trading_loop():
         seed_virtual_ledger_if_empty()
     except Exception as e:
         logger.critical(f"Failed to seed ledger: {e}")
-        # Continue loop but logging critical error.
-    
+        
     while True:
         try:
             if is_paused():
@@ -336,56 +290,106 @@ async def trading_loop():
                 await asyncio.sleep(POLL_MS/1000)
                 continue
 
-            # 1. SELL logic: Check all lots currently held ('OPEN')
             actual_shares = get_actual_position_shares()
+            
+            # --- STARTUP LOGIC ---
+            cur.execute("SELECT COUNT(1) FROM virtual_lots")
+            if cur.fetchone()[0] == 0:
+                logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
+                
+                # Use current price as the anchor buy target
+                target_price = price 
+                
+                # Calculate shares for Level 1 (current_level=0 in function)
+                qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
+
+                if qty > 0 and qty <= MAX_POSITION_SHARES:
+                    
+                    sell_target = round(target_price * 1.01, 8) # 1% above anchor price
+                    
+                    if submit_order("buy", qty, target_price):
+                        # Mark this lot as PENDING until filled
+                        cur.execute("""INSERT OR IGNORE INTO virtual_lots
+                            (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at)
+                            VALUES (?,?,?,?,?,?,?)""",
+                            (1, qty, target_price*qty, target_price, sell_target, "PENDING", int(time.time())))
+                        conn.commit()
+                
+                logger.info(f"Anchor Buy placed: QTY={qty} @ ${target_price:.2f}. Strategy is now active.")
+                await asyncio.sleep(POLL_MS/1000)
+                continue
+            # --- END STARTUP LOGIC ---
+
+
+            # --- RUNNING LOGIC ---
+            
+            # 1. SELL logic: Check all lots currently held ('OPEN')
             cur.execute("SELECT level, virtual_shares, sell_target FROM virtual_lots WHERE status='OPEN' ORDER BY level")
             open_lots = cur.fetchall()
             
             for level, vshares, sell_target in open_lots:
                 if price >= sell_target:
-                    # Safety check: if position is smaller than lot, sell available
                     qty = min(int(vshares), actual_shares) 
                     
-                    if qty < MIN_ORDER_SHARES:
-                        logger.warning("Attempted sell qty less than MIN_ORDER_SHARES or actual position too low for FIFO safety. Skipping sell for level %s", level)
-                        continue
+                    if qty >= MIN_ORDER_SHARES:
+                        logger.info("SELL TRIGGER level=%s sell_target=%s price=%s qty=%s", level, sell_target, price, qty)
                         
-                    logger.info("SELL TRIGGER level=%s sell_target=%s price=%s qty=%s", level, sell_target, price, qty)
-                    
-                    # We assume place_market_order uses LIFO/FIFO correctly if needed, but for Alpaca it's a net change.
-                    # Placing a SELL order
-                    if place_market_order("sell", qty):
-                        # Mark this lot as CLOSED (sold)
-                        cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (level,))
-                        conn.commit()
-                    # Actual shares will be updated on the next loop iteration
+                        # We use submit_order (which is now limit order)
+                        if submit_order("sell", qty, sell_target):
+                            cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (level,))
+                            conn.commit()
 
             # 2. BUY logic: Check all lots waiting to be bought ('PENDING')
             cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING' ORDER BY level DESC")
             pending_rows = cur.fetchall()
             
-            actual_shares = get_actual_position_shares() # Re-fetch updated position after sells
+            # If no pending lots, we need to calculate the next drop target (Level N+1)
+            if not pending_rows:
+                # Find the deepest level currently recorded (OPEN or CLOSED)
+                cur.execute("SELECT MAX(level), buy_price FROM virtual_lots")
+                max_level, anchor_price = cur.fetchone()
+                
+                # Check if we have an anchor price (Level 1 buy_price)
+                cur.execute("SELECT buy_price FROM virtual_lots WHERE level=1")
+                anchor_result = cur.fetchone()
+                anchor_price = anchor_result[0] if anchor_result else INITIAL_PRICE
+                
+                # Calculate the next required buy level
+                qty, buy_target_price = compute_allocation_levels(anchor_price, max_level, INITIAL_CASH, RF, LEVELS)
+
+                if qty > 0 and buy_target_price > 0:
+                    # Insert the new pending lot for the next drop
+                    sell_target = round(anchor_price * 1.01, 8) # Using 1% above anchor price as sell target base (simplification)
+                    
+                    cur.execute("""INSERT INTO virtual_lots
+                        (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at)
+                        VALUES (?,?,?,?,?,?,?)""",
+                        (max_level + 1, qty, buy_target_price*qty, buy_target_price, sell_target, "PENDING", int(time.time())))
+                    conn.commit()
+                    pending_rows = [(max_level + 1, qty, buy_target_price)]
+                    logger.info(f"Prepared next pending lot: Level {max_level + 1} @ ${buy_target_price:.2f}")
+
+
+            # Process PENDING lots (newly created or waiting from earlier)
+            actual_shares = get_actual_position_shares() 
             
             for level, vshares, buy_price in pending_rows:
                 if price <= buy_price:
-                    # Check safety cap before buying
                     if actual_shares + vshares > MAX_POSITION_SHARES:
                         logger.info("Safety cap would be exceeded; skipping buy for level %s", level)
                         continue
                         
                     qty = int(vshares)
                     if qty < MIN_ORDER_SHARES:
-                        logger.warning("Attempted buy qty less than MIN_ORDER_SHARES. Skipping buy for level %s", level)
                         continue
                         
                     logger.info("BUY TRIGGER level=%s buy_price=%s price=%s qty=%s", level, buy_price, price, qty)
                     
-                    # Placing a BUY order
-                    if place_market_order("buy", qty):
-                        # Mark this lot as OPEN (holding)
+                    # Placing a BUY limit order
+                    if submit_order("buy", qty, buy_price):
+                        # We mark as OPEN (holding) only once the order is placed
                         cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE level=?", (level,))
                         conn.commit()
-                        actual_shares += qty # Optimistically update shares for current cycle checks
 
             # 3. Reconcile orders
             reconcile_orders()
@@ -396,12 +400,11 @@ async def trading_loop():
         await asyncio.sleep(POLL_MS/1000)
 
 # ---------- Web UI (aiohttp) ----------
-# (Remaining Web UI functions are correct and unchanged)
+# (All Web UI functions remain correct and unchanged, as they only read the DB)
 
 async def handle_index(request):
     price = get_latest_price()
     pos = get_actual_position_shares()
-    # compute cost basis approximate from virtual ledger: sum virtual_cost of OPEN and CLOSED lots
     cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='OPEN'")
     r = cur.fetchone()
     open_cost = r[0] if r and r[0] else 0.0
