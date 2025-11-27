@@ -290,7 +290,8 @@ async def trading_loop():
     while True:
         try:
             if is_paused():
-                logger.info("Bot is paused (maintenance). Sleeping.)
+                # FIXED: Added closing double-quote
+                logger.info("Bot is paused (maintenance). Sleeping.")
                 await asyncio.sleep(POLL_MS/1000)
                 continue
 
@@ -524,6 +525,4 @@ def create_web_app():
 
 # ---------- Main ----------
 async def main():
-    logger.info("Starting TQQQ bot v2 (alpaca-py)")
-    
-    loop = a
+    logger.info(
