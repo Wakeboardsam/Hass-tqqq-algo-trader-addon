@@ -74,7 +74,7 @@ else:
     logger.warning("Alpaca credentials not found. API features disabled.")
 
 
-# ---------- SQLite ledger setup (CRITICAL FIX: Schema Creation at Module Level) ----------
+# ---------- SQLite ledger setup (FINAL CRITICAL FIX: Schema Creation Moved to Global Scope) ----------
 conn = sqlite3.connect(LEDGER_DB, check_same_thread=False)
 cur = conn.cursor()
 # FIX: The schema MUST be created here, immediately after the connection, 
@@ -384,17 +384,23 @@ async def trading_loop():
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
                 
                 target_price = price 
+                
+                # Aggressive Limit Price: Increase Limit Buy price slightly to guarantee execution
+                # Reduced buffer from 0.05 to 0.01 for less aggressive fill attempt
                 aggressive_limit_price = round(target_price + 0.01, 2)
                 
+                # Calculate shares for Level 1 (current_level=0 in function)
                 qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
 
                 if qty > 0 and qty <= MAX_POSITION_SHARES:
                     
                     sell_target = round(target_price * 1.01, 8) 
                     
+                    # Submit the limit order at the AGGRESSIVE PRICE
                     order_id = submit_order("buy", qty, aggressive_limit_price)
                     
                     if order_id:
+                        # Mark this lot as ORDER_SENT (Order placed, waiting for fill)
                         cur.execute("""INSERT OR IGNORE INTO virtual_lots
                             (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at, alpaca_order_id)
                             VALUES (?,?,?,?,?,?,?,?)""",
@@ -422,6 +428,7 @@ async def trading_loop():
                         # Submit a LIMIT sell order at the target price
                         order_id = submit_order("sell", qty, sell_target)
                         if order_id:
+                            # Mark as ORDER_SENT (waiting for fill)
                             cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (order_id, level))
                             conn.commit()
 
@@ -462,6 +469,8 @@ async def trading_loop():
             cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING' ORDER BY level DESC")
             pending_rows = cur.fetchall()
 
+            actual_shares = reconciliation_status['actual_shares'] 
+            
             for level, vshares, buy_price in pending_rows:
                 # We only place a buy order IF the current price is at or below the target price 
                 if price <= buy_price:
@@ -477,17 +486,4 @@ async def trading_loop():
                     
                     order_id = submit_order("buy", qty, buy_price)
                     if order_id:
-                        # CRITICAL: Move lot to ORDER_SENT status immediately to prevent duplicate orders
-                        cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (order_id, level))
-                        conn.commit()
-            
-        except Exception:
-            logger.exception("Exception in trading loop")
-            
-        await asyncio.sleep(POLL_MS/1000)
-
-# ---------- Web UI (aiohttp) ----------
-async def handle_index(request):
-    price = get_latest_price()
-    pos = get_actual_position_shares()
-    cur.execute("SELECT SUM(virtual_cost) FROM virtual_lo
+                        # CRITICAL: Mov
