@@ -290,7 +290,7 @@ async def trading_loop():
     while True:
         try:
             if is_paused():
-                # FIXED: Added closing double-quote
+                # FIXED: Missing closing parenthesis on line 528 (now line 293)
                 logger.info("Bot is paused (maintenance). Sleeping.")
                 await asyncio.sleep(POLL_MS/1000)
                 continue
@@ -525,4 +525,21 @@ def create_web_app():
 
 # ---------- Main ----------
 async def main():
-    logger.info(
+    logger.info("Starting TQQQ bot v2 (alpaca-py)")
+    
+    loop = asyncio.get_event_loop()
+    app = create_web_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', WEBUI_PORT)
+    await site.start()
+    logger.info(f"Web UI listening on port {WEBUI_PORT}")
+
+    await trading_loop()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down bot")
+
