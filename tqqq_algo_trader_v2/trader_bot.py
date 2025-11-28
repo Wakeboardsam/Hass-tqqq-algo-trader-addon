@@ -74,11 +74,10 @@ else:
     logger.warning("Alpaca credentials not found. API features disabled.")
 
 
-# ---------- SQLite ledger setup (FINAL CRITICAL FIX: Schema Creation Moved to Global Scope) ----------
+# ---------- SQLite ledger setup (Schema Creation) ----------
 conn = sqlite3.connect(LEDGER_DB, check_same_thread=False)
 cur = conn.cursor()
-# FIX: The schema MUST be created here, immediately after the connection, 
-# to guarantee tables exist before any function (reconcile_orders, is_paused, etc.) is called.
+# FIX: Schema created globally to guarantee tables exist before any function call.
 cur.executescript("""
 CREATE TABLE IF NOT EXISTS virtual_lots (
     level INTEGER PRIMARY KEY,
@@ -117,7 +116,7 @@ class VirtualLot:
     status: str  # PENDING, ORDER_SENT, OPEN, or CLOSED
 
 # ---------- Utility functions ----------
-def tail_log(n: int = LOG_TAIL) -> str:
+def tail_log(n: int = LOG_FILE) -> str:
     try:
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()
@@ -157,9 +156,13 @@ def write_meta(key: str, val: str):
     conn.commit()
 
 def read_meta(key: str) -> Optional[str]:
-    cur.execute("SELECT val FROM meta WHERE key=?", (key,))
-    r = cur.fetchone()
-    return r[0] if r else None
+    try:
+        cur.execute("SELECT val FROM meta WHERE key='paused'")
+        v = cur.fetchone()
+        return v[0] if v else None
+    except sqlite3.OperationalError:
+        # If meta table doesn't exist yet, assume not paused
+        return "0" 
 
 
 # --- FEATURE: Reconciliation Check (Internal Double Check) ---
@@ -170,14 +173,18 @@ def get_reconciliation_status() -> dict:
     actual_shares = get_actual_position_shares()
     
     # 2. Calculate Assumed Shares from DB (all 'OPEN' lots)
-    cur.execute("SELECT SUM(virtual_shares) FROM virtual_lots WHERE status='OPEN'")
-    assumed_shares = cur.fetchone()[0] or 0
+    # Safely handle missing tables in case of mid-run clear_db
+    try:
+        cur.execute("SELECT SUM(virtual_shares) FROM virtual_lots WHERE status='OPEN'")
+        assumed_shares = cur.fetchone()[0] or 0
+        
+        cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status IN ('OPEN', 'CLOSED')")
+        total_db_allocation = cur.fetchone()[0] or 0
+    except sqlite3.OperationalError:
+        assumed_shares = 0
+        total_db_allocation = 0.0
     
-    # 3. Get Total Virtual Value (Cost of OPEN + CLOSED)
-    cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status IN ('OPEN', 'CLOSED')")
-    total_db_allocation = cur.fetchone()[0] or 0
-    
-    # 4. Get Total Cash/Buying Power (Alpaca Account)
+    # 3. Get Total Cash/Buying Power (Alpaca Account)
     account_cash = 0.0
     try:
         if api:
@@ -386,7 +393,6 @@ async def trading_loop():
                 target_price = price 
                 
                 # Aggressive Limit Price: Increase Limit Buy price slightly to guarantee execution
-                # FIX: Reduced buffer from 0.05 to 0.01 for less aggressive fill attempt
                 aggressive_limit_price = round(target_price + 0.01, 2)
                 
                 # Calculate shares for Level 1 (current_level=0 in function)
