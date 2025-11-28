@@ -12,8 +12,7 @@ from datetime import datetime, timedelta
 import yaml
 from aiohttp import web
 
-# --- NEW IMPORT ---
-# We import the UI generator from our new assets file
+# --- IMPORT UI GENERATOR ---
 from webui_assets import get_dashboard_html
 
 # ---------- Alpaca-py Imports ----------
@@ -137,12 +136,16 @@ class VirtualLot:
     sell_target: float
     status: str
 
-# ---------- Utility functions ----------
+# ---------- Utility functions (UPDATED LOGIC) ----------
 def tail_log(n: int = LOG_TAIL) -> str:
     try:
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()
-        return "".join(lines[-n:])
+        # Grab the last 'n' lines
+        last_lines = lines[-n:]
+        # Reverse them so the newest line is at the top
+        last_lines.reverse()
+        return "".join(last_lines)
     except Exception:
         return ""
 
@@ -239,7 +242,6 @@ def sync_alpaca_state():
         logger.info(f"Found {len(orders)} OPEN orders on Alpaca. importing...")
         
         # Sort orders by price descending (highest buy price = Level 1)
-        # This prevents Level 1 being assigned to a low-ball offer
         orders.sort(key=lambda x: float(x.limit_price) if x.limit_price else 0, reverse=True)
 
         for i, o in enumerate(orders):
@@ -247,7 +249,6 @@ def sync_alpaca_state():
                 qty = int(float(o.qty))
                 price = float(o.limit_price) if o.limit_price else 0.0
                 
-                # Assign level based on sorted order (Highest price = Level 1, Next = Level 2)
                 cur.execute("SELECT MAX(level) FROM virtual_lots")
                 current_max = cur.fetchone()[0]
                 new_level = 1 if current_max is None else current_max + 1
@@ -409,6 +410,7 @@ def set_paused(val: bool):
 # ---------- Core trading loop ----------
 async def trading_loop():
     logger.info("Starting trading loop")
+    
     try:
         sync_alpaca_state()
     except Exception as e:
@@ -445,7 +447,10 @@ async def trading_loop():
             if cur.fetchone()[0] == 0:
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
                 target_price = price 
+                
+                # Aggressive Limit Price (+0.5%)
                 aggressive_limit_price = round(target_price * 1.005, 2)
+                
                 qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
 
                 if qty > 0 and qty <= MAX_POSITION_SHARES:
@@ -524,122 +529,4 @@ async def trading_loop():
                     logger.info(f"BUY TRIGGER level={level} price={price}")
                     order_id = submit_order("buy", qty, buy_price)
                     if order_id:
-                        cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (order_id, level))
-                        conn.commit()
-            
-        except Exception:
-            logger.exception("Exception in trading loop")
-        await asyncio.sleep(POLL_MS/1000)
-
-# ---------- Web UI (Now uses imported function) ----------
-async def handle_index(request):
-    price = get_latest_price()
-    pos = get_actual_position_shares()
-    
-    # Get all DB rows to pass to the template
-    cur.execute("SELECT level, virtual_shares, buy_price, sell_target, status, alpaca_order_id FROM virtual_lots ORDER BY level ASC")
-    db_rows = cur.fetchall()
-    
-    cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='OPEN'")
-    r = cur.fetchone()
-    open_cost = r[0] if r and r[0] else 0.0
-    
-    cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='CLOSED'")
-    r = cur.fetchone()
-    closed_cost = r[0] if r and r[0] else 0.0
-    
-    reco_status = get_reconciliation_status()
-    
-    # Generate the HTML using the imported function
-    html = get_dashboard_html(
-        SYMBOL, 
-        price, 
-        pos, 
-        open_cost, 
-        closed_cost, 
-        reco_status, 
-        db_rows, 
-        tail_log(200),
-        is_paused()
-    )
-    return web.Response(text=html, content_type='text/html')
-
-async def api_clear_db(request):
-    clear_db()
-    raise web.HTTPFound('/')
-
-async def api_status(request):
-    price = get_latest_price()
-    pos = get_actual_position_shares()
-    cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='OPEN'")
-    open_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='CLOSED'")
-    closed_count = cur.fetchone()[0]
-    data = {
-        "symbol": SYMBOL,
-        "price": price,
-        "position_shares": pos,
-        "open_virtual_lots": open_count,
-        "closed_virtual_lots": closed_count,
-        "reduction_factor": RF,
-        "paused": is_paused()
-    }
-    return web.json_response(data)
-
-async def api_levels(request):
-    cur.execute("SELECT level, virtual_shares, virtual_cost, buy_price, sell_target, status FROM virtual_lots ORDER BY level")
-    rows = cur.fetchall()
-    levels = []
-    for r in rows:
-        levels.append({
-            "level": r[0],
-            "virtual_shares": r[1],
-            "virtual_cost": r[2],
-            "buy_price": r[3],
-            "sell_target": r[4],
-            "status": r[5]
-        })
-    return web.json_response({"levels": levels})
-
-async def api_logs(request):
-    return web.Response(text=tail_log(LOG_TAIL), content_type='text/plain')
-
-async def api_clear_logs(request):
-    clear_log()
-    raise web.HTTPFound('/')
-
-async def api_pause(request):
-    set_paused(True)
-    raise web.HTTPFound('/')
-
-async def api_resume(request):
-    set_paused(False)
-    raise web.HTTPFound('/')
-
-def create_web_app():
-    app = web.Application()
-    app.router.add_get('/', handle_index)
-    app.router.add_get('/api/status', api_status)
-    app.router.add_get('/api/levels', api_levels)
-    app.router.add_post('/api/clear-logs', api_clear_logs)
-    app.router.add_post('/api/clear-db', api_clear_db)
-    app.router.add_post('/api/pause', api_pause)
-    app.router.add_post('/api/resume', api_resume)
-    return app
-
-async def main():
-    logger.info("Starting TQQQ bot v2 (alpaca-py)")
-    loop = asyncio.get_event_loop()
-    app = create_web_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', WEBUI_PORT)
-    await site.start()
-    logger.info(f"Web UI listening on port {WEBUI_PORT}")
-    await trading_loop()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Shutting down bot")
+                        cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca
