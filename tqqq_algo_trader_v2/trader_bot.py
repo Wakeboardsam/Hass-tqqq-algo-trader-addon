@@ -79,7 +79,7 @@ MAX_POSITION_SHARES = int(cfg.get("max_position_shares", 200000))
 WEBUI_PORT = int(cfg.get("webui_port", 8080))
 LOG_TAIL = 200
 
-logger.info(f"Configuration Loaded: Symbol={SYMBOL}, Config Cash={CONFIG_INITIAL_CASH}, RF={RF}")
+logger.info(f"Configuration Loaded: Symbol={SYMBOL}, Config Cash={CONFIG_INITIAL_CASH}, RF={RF}, Levels={LEVELS}")
 logger.info(f"Persistence Enabled: Database and Logs saved to {CONFIG_DIR}")
 
 # ---------- Alpaca Client Setup ----------
@@ -236,14 +236,37 @@ def get_season_stats() -> dict:
             "last_season_pl": 0.0
         }
 
-# ---------- Reconciliation Check ----------
+# ---------- Reconciliation Check (UPDATED) ----------
 def get_reconciliation_status() -> dict:
     actual_shares = get_actual_position_shares()
+    assumed_shares = 0
+    total_db_allocation = 0.0
+    
     try:
+        # 1. Sum fully OPEN lots
         cur.execute("SELECT SUM(virtual_shares) FROM virtual_lots WHERE status='OPEN'")
-        assumed_shares = cur.fetchone()[0] or 0
+        open_shares = cur.fetchone()[0] or 0
+        
+        # 2. Sum lots involved in pending orders (Partial Fills or In-Flight)
+        # This prevents the "Mismatch" error when an order is filled but DB isn't updated yet
+        pending_shares = 0
+        if api:
+            cur.execute("SELECT alpaca_order_id FROM virtual_lots WHERE status='ORDER_SENT'")
+            sent_orders = cur.fetchall()
+            for (oid,) in sent_orders:
+                if oid:
+                    try:
+                        o = api.get_order_by_id(oid)
+                        # Add whatever has been filled on this pending order to our "Assumed" count
+                        pending_shares += int(float(o.filled_qty))
+                    except Exception:
+                        pass
+
+        assumed_shares = open_shares + pending_shares
+
         cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status IN ('OPEN', 'CLOSED')")
         total_db_allocation = cur.fetchone()[0] or 0
+        
     except sqlite3.OperationalError:
         assumed_shares = 0
         total_db_allocation = 0.0
@@ -397,6 +420,7 @@ def reconcile_orders():
 
                 cur.execute("UPDATE orders SET status=? WHERE id=?", (order_status, rid))
 
+                # Handle Filled AND Partially Filled (to update status text)
                 if order_status == 'filled' and lot_level is not None:
                     cur.execute("SELECT side FROM orders WHERE alpaca_id=?", (aid,))
                     order_side = cur.fetchone()
@@ -406,6 +430,11 @@ def reconcile_orders():
                     elif order_side and order_side[0] == 'sell':
                         cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (lot_level,))
                         logger.info(f"Lot Level {lot_level} moved to CLOSED (Sold).")
+                elif order_status == 'partially_filled' and lot_level is not None:
+                     # We keep it as ORDER_SENT but maybe log it?
+                     # The reconciliation check will now handle the qty mismatch safely.
+                     pass
+
             except Exception:
                 pass
         conn.commit()
@@ -461,8 +490,9 @@ async def trading_loop():
             # --- NEW: Check for Anchor Reset ---
             check_anchor_reset()
             
+            # Even if paused, we run reconcile above. But we skip NEW logic below.
             if is_paused():
-                logger.info("Bot is paused (maintenance). Sleeping.")
+                logger.info("Bot is paused (maintenance or mismatch). Sleeping.")
                 await asyncio.sleep(POLL_MS/1000)
                 continue
 
@@ -474,6 +504,8 @@ async def trading_loop():
             reconciliation_status = get_reconciliation_status()
             if not reconciliation_status['reconciled']:
                 logger.warning(f"MISMATCH: DB {reconciliation_status['assumed_shares']} != Alpaca {reconciliation_status['actual_shares']}. Paused.")
+                # We do NOT set_paused(True) here because that requires manual intervention.
+                # Instead we just sleep/continue, effectively pausing loop logic until mismatch resolves.
                 await asyncio.sleep(POLL_MS/1000)
                 continue
 
