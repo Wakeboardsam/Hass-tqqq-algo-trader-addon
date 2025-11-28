@@ -12,7 +12,11 @@ from datetime import datetime, timedelta
 import yaml
 from aiohttp import web
 
-# ---------- Alpaca-py Imports (UPDATED) ----------
+# --- NEW IMPORT ---
+# We import the UI generator from our new assets file
+from webui_assets import get_dashboard_html
+
+# ---------- Alpaca-py Imports ----------
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
@@ -205,7 +209,8 @@ def get_reconciliation_status() -> dict:
         "assumed_shares": assumed_shares,
         "shares_delta": actual_shares - assumed_shares,
         "total_db_allocation": round(total_db_allocation, 2),
-        "alpaca_cash": round(account_cash, 2)
+        "alpaca_cash": round(account_cash, 2),
+        "timestamp": datetime.now().strftime("%H:%M:%S")
     }
 
 # ---------- New Feature: Smart Startup Sync ----------
@@ -232,33 +237,30 @@ def sync_alpaca_state():
             return
 
         logger.info(f"Found {len(orders)} OPEN orders on Alpaca. importing...")
+        
+        # Sort orders by price descending (highest buy price = Level 1)
+        # This prevents Level 1 being assigned to a low-ball offer
+        orders.sort(key=lambda x: float(x.limit_price) if x.limit_price else 0, reverse=True)
 
-        for o in orders:
-            # We found an order! 
-            # Since the DB is empty, we must assume this is our "Anchor" or a recovered lot.
-            # For simplicity in this recovery logic, if we find a BUY, we assign it Level 1.
-            
+        for i, o in enumerate(orders):
             if o.side == OrderSide.BUY:
                 qty = int(float(o.qty))
                 price = float(o.limit_price) if o.limit_price else 0.0
                 
-                # Assume Level 1 for the first recovered buy order
-                # (In a complex scenario we might try to guess the level, but L1 is safest for Anchor recovery)
+                # Assign level based on sorted order (Highest price = Level 1, Next = Level 2)
                 cur.execute("SELECT MAX(level) FROM virtual_lots")
                 current_max = cur.fetchone()[0]
                 new_level = 1 if current_max is None else current_max + 1
                 
-                sell_target = round(price * 1.01, 8) # Estimated target
+                sell_target = round(price * 1.01, 8) 
                 
                 logger.info(f"IMPORTING Order {o.id}: BUY {qty} @ {price}. Assigning to Level {new_level}.")
                 
-                # Insert into DB as ORDER_SENT
                 cur.execute("""INSERT OR IGNORE INTO virtual_lots
                     (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at, alpaca_order_id)
                     VALUES (?,?,?,?,?,?,?,?)""",
                     (new_level, qty, price*qty, price, sell_target, "ORDER_SENT", int(time.time()), str(o.id)))
                 
-                # Also log in orders table
                 cur.execute("""INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) 
                     VALUES (?,?,?,?,?,?)""",
                     (str(o.id), "buy", qty, price, "new", int(time.time())))
@@ -407,14 +409,11 @@ def set_paused(val: bool):
 # ---------- Core trading loop ----------
 async def trading_loop():
     logger.info("Starting trading loop")
-    
-    # NEW STEP 1: Sync with Alpaca BEFORE doing anything else
     try:
         sync_alpaca_state()
     except Exception as e:
         logger.error(f"Error during startup sync: {e}")
 
-    # STEP 2: Standard checks
     try:
         seed_virtual_ledger_if_empty()
     except Exception as e:
@@ -442,15 +441,11 @@ async def trading_loop():
             actual_shares = reconciliation_status['actual_shares']
             
             # --- STARTUP LOGIC ---
-            # Check if ledger is empty (It won't be if sync_alpaca_state worked!)
             cur.execute("SELECT COUNT(1) FROM virtual_lots")
             if cur.fetchone()[0] == 0:
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
                 target_price = price 
-                
-                # UPDATE: 0.5% (Half Percent) Limit Buffer
                 aggressive_limit_price = round(target_price * 1.005, 2)
-                
                 qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
 
                 if qty > 0 and qty <= MAX_POSITION_SHARES:
@@ -536,10 +531,15 @@ async def trading_loop():
             logger.exception("Exception in trading loop")
         await asyncio.sleep(POLL_MS/1000)
 
-# ---------- Web UI (SAFE FORMATTING) ----------
+# ---------- Web UI (Now uses imported function) ----------
 async def handle_index(request):
     price = get_latest_price()
     pos = get_actual_position_shares()
+    
+    # Get all DB rows to pass to the template
+    cur.execute("SELECT level, virtual_shares, buy_price, sell_target, status, alpaca_order_id FROM virtual_lots ORDER BY level ASC")
+    db_rows = cur.fetchall()
+    
     cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='OPEN'")
     r = cur.fetchone()
     open_cost = r[0] if r and r[0] else 0.0
@@ -549,40 +549,18 @@ async def handle_index(request):
     closed_cost = r[0] if r and r[0] else 0.0
     
     reco_status = get_reconciliation_status()
-    reco_alert = ""
-    if not reco_status['reconciled']:
-        reco_alert = f"<p style='color:red; font-weight:bold;'>WARNING: Share Mismatch! DB ({reco_status['assumed_shares']}) != Alpaca ({reco_status['actual_shares']})</p>"
     
-    # SAFE STRING CONCATENATION (Prevents copy-paste line break errors)
-    html = (
-        "<html>\n"
-        "<head><title>TQQQ Bot Status</title></head>\n"
-        "<body>\n"
-        "<h2>TQQQ Bot Status</h2>\n"
-        f"{reco_alert}\n"
-        f"<p>Symbol: {SYMBOL}</p>\n"
-        f"<p>Current Price: {price}</p>\n"
-        f"<p>Actual Position Shares (Alpaca): {pos}</p>\n"
-        f"<p>Open Virtual Cost (sum): {open_cost:.2f}</p>\n"
-        f"<p>Closed Virtual Cost (sum): {closed_cost:.2f}</p>\n"
-        f"<p>Reduction Factor: {RF}</p>\n"
-        f"<p>Levels configured: {LEVELS}</p>\n"
-        f"<p>Initial Cash: ${INITIAL_CASH}</p>\n"
-        f"<p>Database Location: {CONFIG_DIR}</p>\n"
-        "<p><a href='/api/levels'>View full levels (JSON)</a></p>\n"
-        "<form method='post' action='/api/clear-logs' style='display:inline;'><button type='submit'>Clear Logs</button></form>\n"
-        "<form method='post' action='/api/clear-db' style='display:inline;'><button type='submit'>Clear Database (DANGER!)</button></form>\n"
-        "<form method='post' action='/api/pause' style='display:inline;'><button type='submit'>Pause Bot</button></form>\n"
-        "<form method='post' action='/api/resume' style='display:inline;'><button type='submit'>Resume Bot</button></form>\n"
-        "<h3>Reconciliation Data</h3>\n"
-        "<ul>\n"
-        f"<li>Shares Delta (Actual - Assumed): {reco_status['shares_delta']}</li>\n"
-        f"<li>Account Buying Power: ${reco_status['alpaca_cash']:.2f}</li>\n"
-        "</ul>\n"
-        "<h3>Recent logs</h3>\n"
-        f"<pre>{tail_log(200)}</pre>\n"
-        "</body>\n"
-        "</html>"
+    # Generate the HTML using the imported function
+    html = get_dashboard_html(
+        SYMBOL, 
+        price, 
+        pos, 
+        open_cost, 
+        closed_cost, 
+        reco_status, 
+        db_rows, 
+        tail_log(200),
+        is_paused()
     )
     return web.Response(text=html, content_type='text/html')
 
