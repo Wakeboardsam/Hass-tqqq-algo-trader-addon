@@ -1,6 +1,6 @@
 {
   "name": "TQQQ Grid Bot v2",
-  "version": "0.1.54",
+  "version": "0.1.55",
   "slug": "tqqq_algo_trader_v2",
   "description": "Alpaca Grid Bot using a virtual ledger with Web UI",
   "arch": ["amd64", "armv7", "aarch64", "armhf"],
@@ -41,7 +41,7 @@
     "max_position_shares": "int",
     "webui_enabled": "bool",
     "webui_port": "int",
-    "timezone": "str"
+    "timezone": "list(America/New_York|America/Chicago|America/Denver|America/Phoenix|America/Los_Angeles|America/Anchorage|Pacific/Honolulu|UTC)"
   },
   "host_network": false
 }
