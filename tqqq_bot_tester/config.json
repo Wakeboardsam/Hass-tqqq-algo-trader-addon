@@ -1,0 +1,41 @@
+{
+  "name": "TQQQ Bot Tester (Simulation)",
+  "version": "0.0.1",
+  "slug": "tqqq_bot_tester",
+  "description": "Simulation Sandbox for TQQQ Grid Strategy. No Real Trading.",
+  "arch": ["amd64", "armv7", "aarch64", "armhf"],
+  "init": false,
+  "startup": "services",
+  "boot": "auto",
+  "ports": {
+    "8081/tcp": 8081
+  },
+  "map": [
+    "config:rw"
+  ],
+  "options": {
+    "symbol": "TQQQ_SIM",
+    "manual_market_price": 100.00,
+    "reduction_factor": 0.955,
+    "levels": 88,
+    "initial_cash": 100000,
+    "poll_interval_ms": 1000,
+    "min_order_shares": 1,
+    "max_position_shares": 200000,
+    "webui_port": 8081,
+    "timezone": "America/Denver"
+  },
+  "schema": {
+    "symbol": "str",
+    "manual_market_price": "float",
+    "reduction_factor": "float",
+    "levels": "int",
+    "initial_cash": "float",
+    "poll_interval_ms": "int",
+    "min_order_shares": "int",
+    "max_position_shares": "int",
+    "webui_port": "int",
+    "timezone": "list(America/New_York|America/Chicago|America/Denver|America/Phoenix|America/Los_Angeles|America/Anchorage|Pacific/Honolulu|UTC)"
+  },
+  "host_network": false
+}
