@@ -31,7 +31,6 @@ logger = logging.getLogger("tqqq-bot")
 
 # ---------- Config ----------
 # CRITICAL FIX: Force the script to read the Home Assistant options file.
-# We bypass os.environ.get to ignore any Docker defaults pointing to yaml.
 BOT_CONFIG = "/data/options.json"
 LEDGER_DB = os.environ.get("LEDGER_DB", "/data/tqqq-bot/ledger_v2.db")
 
@@ -42,7 +41,7 @@ try:
         cfg = json.load(f)
         logger.info(f"Loaded config from {BOT_CONFIG}")
 except (FileNotFoundError, json.JSONDecodeError):
-    # Fallback to YAML if JSON fails (Backward compatibility/Local testing)
+    # Fallback to YAML if JSON fails
     try:
         with open(BOT_CONFIG, 'r') as f:
             cfg = yaml.safe_load(f)
@@ -65,11 +64,11 @@ POLL_MS = int(cfg.get("poll_interval_ms", 500))
 MIN_ORDER_SHARES = int(cfg.get("min_order_shares", 1))
 MAX_POSITION_SHARES = int(cfg.get("max_position_shares", 200000))
 WEBUI_PORT = int(cfg.get("webui_port", 8080))
-LOG_TAIL = 200 # Default if not in config
+LOG_TAIL = 200
 
 logger.info(f"Configuration Loaded: Symbol={SYMBOL}, Cash={INITIAL_CASH}, RF={RF}, Levels={LEVELS}")
 
-# ---------- Alpaca Client Setup (UPDATED) ----------
+# ---------- Alpaca Client Setup ----------
 api: Optional[TradingClient] = None
 data_api: Optional[StockHistoricalDataClient] = None
 
@@ -86,10 +85,9 @@ else:
     logger.warning("Alpaca credentials not found. API features disabled.")
 
 
-# ---------- SQLite ledger setup (Schema Creation) ----------
+# ---------- SQLite ledger setup ----------
 conn = sqlite3.connect(LEDGER_DB, check_same_thread=False)
 cur = conn.cursor()
-# FIX: Schema created globally to guarantee tables exist before any function call.
 cur.executescript("""
 CREATE TABLE IF NOT EXISTS virtual_lots (
     level INTEGER PRIMARY KEY,
@@ -125,7 +123,7 @@ class VirtualLot:
     virtual_cost: float
     buy_price: float
     sell_target: float
-    status: str  # PENDING, ORDER_SENT, OPEN, or CLOSED
+    status: str
 
 # ---------- Utility functions ----------
 def tail_log(n: int = LOG_TAIL) -> str:
@@ -145,23 +143,19 @@ def clear_log():
         logger.exception("Failed clearing log")
         return False
 
-# --- Clear Database and Schema Reset ---
 def clear_db():
     try:
-        # Drop tables first to force a schema recreation upon next loop start
         cur.executescript("""
             DROP TABLE IF EXISTS virtual_lots;
             DROP TABLE IF EXISTS orders;
             DROP TABLE IF EXISTS meta;
         """)
         conn.commit()
-        # The next time the bot starts, the tables will be recreated by the module-level script execution.
-        logger.info("Database (virtual_lots, orders, meta) DROPPED and cleared via web UI. Restart required.")
+        logger.info("Database (virtual_lots, orders, meta) DROPPED via web UI.")
         return True
     except Exception as e:
         logger.exception("Failed clearing database")
         return False
-
 
 def write_meta(key: str, val: str):
     cur.execute("INSERT OR REPLACE INTO meta (key,val) VALUES (?,?)", (key, val))
@@ -173,30 +167,20 @@ def read_meta(key: str) -> Optional[str]:
         v = cur.fetchone()
         return v[0] if v else None
     except sqlite3.OperationalError:
-        # If meta table doesn't exist yet, assume not paused
         return "0" 
 
-
-# --- FEATURE: Reconciliation Check (Internal Double Check) ---
+# --- Feature: Reconciliation Check ---
 def get_reconciliation_status() -> dict:
-    """Compares actual shares held on Alpaca vs. the total recorded in the database."""
-    
-    # 1. Get Actual Shares from Alpaca
     actual_shares = get_actual_position_shares()
-    
-    # 2. Calculate Assumed Shares from DB (all 'OPEN' lots)
-    # Safely handle missing tables in case of mid-run clear_db
     try:
         cur.execute("SELECT SUM(virtual_shares) FROM virtual_lots WHERE status='OPEN'")
         assumed_shares = cur.fetchone()[0] or 0
-        
         cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status IN ('OPEN', 'CLOSED')")
         total_db_allocation = cur.fetchone()[0] or 0
     except sqlite3.OperationalError:
         assumed_shares = 0
         total_db_allocation = 0.0
     
-    # 3. Get Total Cash/Buying Power (Alpaca Account)
     account_cash = 0.0
     try:
         if api:
@@ -218,27 +202,20 @@ def get_reconciliation_status() -> dict:
 
 # ---------- Reduction-factor allocation ----------
 def compute_allocation_levels(anchor_price: float, current_level: int, starting_cash: float, rf: float, total_levels: int) -> tuple[int, float]:
-    """Calculates the shares and price for the NEXT required level (current_level + 1)."""
     next_level = current_level + 1
     if next_level > total_levels:
         return 0, 0.0
 
     denom = (1 - (rf ** total_levels)) if rf != 1.0 else total_levels
     base_alloc_factor = (1 - rf) / denom
-    
-    # Calculate allocation for the next level's index
     alloc_cash = starting_cash * base_alloc_factor * (rf ** current_level) 
-    
-    # Calculate the price for the next level (1% step down based on original anchor price)
     step_down_percent = 0.01 
     buy_price = round(anchor_price * (1 - (next_level * step_down_percent)), 8)
-
     shares = max(MIN_ORDER_SHARES, int(alloc_cash // buy_price))
     
     return shares, buy_price
 
 def seed_virtual_ledger_if_empty():
-    """Checks if virtual_lots table has any data."""
     cur.execute("SELECT COUNT(1) FROM virtual_lots")
     if cur.fetchone()[0] == 0:
         logger.info("Ledger is empty. Ready for initial buy sequence.")
@@ -250,12 +227,11 @@ def load_open_virtual_lots() -> List[VirtualLot]:
     )
     return [VirtualLot(*r) for r in cur.fetchall()]
 
-# ---------- Alpaca helpers (UPDATED for alpaca-py) ----------
+# ---------- Alpaca helpers ----------
 def get_latest_price() -> Optional[float]:
     if not data_api:
         return None
     try:
-        # Use latest trade price for accuracy
         req = StockLatestTradeRequest(symbol_or_symbols=[SYMBOL])
         trade = data_api.get_stock_latest_trade(req)
         return float(trade[SYMBOL].price)
@@ -263,7 +239,6 @@ def get_latest_price() -> Optional[float]:
         logger.warning("Failed to fetch latest trade price. Falling back to bar close.")
 
     try:
-        # Fallback: minute bar
         req = StockBarsRequest(
             symbol_or_symbols=[SYMBOL],
             timeframe=TimeFrame.Minute,
@@ -286,19 +261,17 @@ def get_actual_position_shares() -> int:
         return 0
 
 def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
-    """Submits a Limit Order using the user's required Time In Force and Extended Hours."""
     if qty <= 0 or not api:
         return None
     
     side = OrderSide.BUY if side_str.lower() == 'buy' else OrderSide.SELL
-    
     req = LimitOrderRequest(
         symbol=SYMBOL,
         qty=qty,
         side=side,
-        limit_price=round(price, 2), # Price must be rounded for Alpaca API
+        limit_price=round(price, 2),
         time_in_force=TimeInForce.DAY,
-        extended_hours=True # User requested Extended Hours for reliable fills
+        extended_hours=True
     )
 
     try:
@@ -319,7 +292,6 @@ def reconcile_orders():
     if not api:
         return
     try:
-        # Check all orders not yet finalized
         cur.execute(
             "SELECT id, alpaca_id FROM orders "
             "WHERE status NOT IN ('filled','canceled','expired')"
@@ -329,26 +301,19 @@ def reconcile_orders():
             try:
                 o = api.get_order_by_id(aid)
                 order_status = str(o.status)
-
-                # Find the virtual lot associated with this order ID
                 cur.execute("SELECT level FROM virtual_lots WHERE alpaca_order_id=?", (aid,))
                 lot_level_result = cur.fetchone()
                 lot_level = lot_level_result[0] if lot_level_result else None
 
-                # 1. Update the orders table status
                 cur.execute("UPDATE orders SET status=? WHERE id=?", (order_status, rid))
 
-                # 2. Update virtual_lots status if the order is filled
                 if order_status == 'filled' and lot_level is not None:
                     cur.execute("SELECT side FROM orders WHERE alpaca_id=?", (aid,))
                     order_side = cur.fetchone()
-                    
                     if order_side and order_side[0] == 'buy':
-                        # If the buy order filled, the lot is now OPEN (holding)
                         cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE level=?", (lot_level,))
                         logger.info(f"Lot Level {lot_level} moved to OPEN (Filled).")
                     elif order_side and order_side[0] == 'sell':
-                        # If the sell order filled, the lot is now CLOSED (sold)
                         cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (lot_level,))
                         logger.info(f"Lot Level {lot_level} moved to CLOSED (Sold).")
 
@@ -370,11 +335,9 @@ def is_paused() -> bool:
 def set_paused(val: bool):
     write_meta("paused", "1" if val else "0")
 
-# ---------- Core trading loop (UPDATED Logic) ----------
+# ---------- Core trading loop ----------
 async def trading_loop():
     logger.info("Starting trading loop")
-    
-    # Run schema creation and check empty ledger
     try:
         seed_virtual_ledger_if_empty()
     except Exception as e:
@@ -382,9 +345,7 @@ async def trading_loop():
         
     while True:
         try:
-            # 3. Reconcile orders FIRST so we know which lots are now OPEN
             reconcile_orders()
-            
             if is_paused():
                 logger.info("Bot is paused (maintenance). Sleeping.")
                 await asyncio.sleep(POLL_MS/1000)
@@ -395,143 +356,106 @@ async def trading_loop():
                 await asyncio.sleep(POLL_MS/1000)
                 continue
 
-            # Check reconciliation status before proceeding
             reconciliation_status = get_reconciliation_status()
             if not reconciliation_status['reconciled']:
-                logger.warning(f"RECONCILIATION MISMATCH: DB Assumed {reconciliation_status['assumed_shares']} shares, Alpaca reports {reconciliation_status['actual_shares']} shares. Delta: {reconciliation_status['shares_delta']}. Bot action paused.")
-                # Pausing action until manual review (or auto-correction logic is added later)
+                logger.warning(f"MISMATCH: DB {reconciliation_status['assumed_shares']} != Alpaca {reconciliation_status['actual_shares']}. Paused.")
                 await asyncio.sleep(POLL_MS/1000)
                 continue
 
-
             actual_shares = reconciliation_status['actual_shares']
             
-            # --- STARTUP LOGIC: Place Level 1 Anchor Buy ---
+            # --- STARTUP LOGIC ---
             cur.execute("SELECT COUNT(1) FROM virtual_lots")
             if cur.fetchone()[0] == 0:
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
-                
                 target_price = price 
-                
-                # Aggressive Limit Price: Increase Limit Buy price slightly to guarantee execution
                 aggressive_limit_price = round(target_price + 0.01, 2)
-                
-                # Calculate shares for Level 1 (current_level=0 in function)
                 qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
 
                 if qty > 0 and qty <= MAX_POSITION_SHARES:
-                    
                     sell_target = round(target_price * 1.01, 8) 
-                    
-                    # Submit the limit order at the AGGRESSIVE PRICE
                     order_id = submit_order("buy", qty, aggressive_limit_price)
-                    
                     if order_id:
-                        # Mark this lot as ORDER_SENT (Order placed, waiting for fill)
                         cur.execute("""INSERT OR IGNORE INTO virtual_lots
                             (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at, alpaca_order_id)
                             VALUES (?,?,?,?,?,?,?,?)""",
                             (1, qty, target_price*qty, target_price, sell_target, "ORDER_SENT", int(time.time()), order_id))
                         conn.commit()
-                
-                logger.info(f"Anchor Buy submitted: QTY={qty} @ ${aggressive_limit_price:.2f} (Aggressive Limit). Strategy is now PENDING fill.")
+                logger.info(f"Anchor Buy submitted: QTY={qty} @ ${aggressive_limit_price:.2f}")
                 await asyncio.sleep(POLL_MS/1000)
                 continue
-            # --- END STARTUP LOGIC ---
 
             # --- RUNNING LOGIC ---
-            
-            # 1. SELL logic: Check all lots currently held ('OPEN')
+            # 1. SELL logic
             cur.execute(
                 "SELECT level, virtual_shares, sell_target FROM virtual_lots "
                 "WHERE status='OPEN' ORDER BY level"
             )
             open_lots = cur.fetchall()
-            
             for level, vshares, sell_target in open_lots:
                 if price >= sell_target:
                     qty = min(int(vshares), actual_shares) 
-                    
                     if qty >= MIN_ORDER_SHARES:
-                        logger.info("SELL TRIGGER level=%s sell_target=%s price=%s qty=%s", level, sell_target, price, qty)
-                        
-                        # Submit a LIMIT sell order at the target price
+                        logger.info(f"SELL TRIGGER level={level} target={sell_target} price={price}")
                         order_id = submit_order("sell", qty, sell_target)
                         if order_id:
-                            # Mark as ORDER_SENT (waiting for fill)
                             cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (order_id, level))
                             conn.commit()
 
-            # 2. BUY logic: Check all lots waiting to be bought ('PENDING')
+            # 2. BUY logic
             cur.execute(
                 "SELECT level, virtual_shares, buy_price FROM virtual_lots "
                 "WHERE status='PENDING' ORDER BY level DESC"
             )
             pending_rows = cur.fetchall()
             
-            
-            # If no PENDING lots exist, and no lots are ORDER_SENT, calculate and create the next PENDING lot (Level N+1)
             cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='ORDER_SENT'")
             orders_sent_count = cur.fetchone()[0]
             
             if not pending_rows and orders_sent_count == 0:
-                
                 cur.execute("SELECT MAX(level) FROM virtual_lots")
                 max_level = cur.fetchone()[0] or 0
-                
                 cur.execute("SELECT buy_price FROM virtual_lots WHERE level=1")
                 anchor_result = cur.fetchone()
                 anchor_price = anchor_result[0] if anchor_result else 0.0 
                 
                 if anchor_price > 0:
                     qty, buy_target_price = compute_allocation_levels(anchor_price, max_level, INITIAL_CASH, RF, LEVELS)
-
                     if qty > 0 and buy_target_price > 0:
-                        
                         sell_target = round(buy_target_price * 1.01, 8) 
-                        
                         cur.execute("""INSERT INTO virtual_lots
                             (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at)
                             VALUES (?,?,?,?,?,?,?)""",
                             (max_level + 1, qty, buy_target_price*qty, buy_target_price, sell_target, "PENDING", int(time.time())))
                         conn.commit()
-                        
                         logger.info(f"Prepared next pending lot: Level {max_level + 1} @ ${buy_target_price:.2f}")
 
-            # Re-fetch PENDING rows now that the new one might be created
             cur.execute(
                 "SELECT level, virtual_shares, buy_price FROM virtual_lots "
                 "WHERE status='PENDING' ORDER BY level DESC"
             )
             pending_rows = cur.fetchall()
-
             actual_shares = reconciliation_status['actual_shares'] 
             
             for level, vshares, buy_price in pending_rows:
-                # We only place a buy order IF the current price is at or below the target price 
                 if price <= buy_price:
                     if actual_shares + vshares > MAX_POSITION_SHARES:
-                        logger.info("Safety cap would be exceeded; skipping buy for level %s", level)
                         continue
-                        
                     qty = int(vshares)
                     if qty < MIN_ORDER_SHARES:
                         continue
-                        
-                    logger.info("BUY TRIGGER level=%s buy_price=%s price=%s qty=%s", level, buy_price, price, qty)
                     
+                    logger.info(f"BUY TRIGGER level={level} price={price}")
                     order_id = submit_order("buy", qty, buy_price)
                     if order_id:
-                        # CRITICAL: Move lot to ORDER_SENT status immediately to prevent duplicate orders
                         cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (order_id, level))
                         conn.commit()
             
         except Exception:
             logger.exception("Exception in trading loop")
-            
         await asyncio.sleep(POLL_MS/1000)
 
-# ---------- Web UI (aiohttp) ----------
+# ---------- Web UI (SAFE FORMATTING) ----------
 async def handle_index(request):
     price = get_latest_price()
     pos = get_actual_position_shares()
@@ -543,28 +467,119 @@ async def handle_index(request):
     r = cur.fetchone()
     closed_cost = r[0] if r and r[0] else 0.0
     
-    # Get Reconciliation Status
     reco_status = get_reconciliation_status()
     reco_alert = ""
     if not reco_status['reconciled']:
-        reco_alert = f"""<p style='color:red; font-weight:bold;'>WARNING: Share Mismatch! DB ({reco_status['assumed_shares']}) != Alpaca ({reco_status['actual_shares']})</p>"""
+        reco_alert = f"<p style='color:red; font-weight:bold;'>WARNING: Share Mismatch! DB ({reco_status['assumed_shares']}) != Alpaca ({reco_status['actual_shares']})</p>"
     
-    html = f"""
-    <html>
-    <head><title>TQQQ Bot Status</title></head>
-    <body>
-      <h2>TQQQ Bot Status</h2>
-      {reco_alert}
-      <p>Symbol: {SYMBOL}</p>
-      <p>Current Price: {price}</p>
-      <p>Actual Position Shares (Alpaca): {pos}</p>
-      <p>Open Virtual Cost (sum): {open_cost:.2f}</p>
-      <p>Closed Virtual Cost (sum): {closed_cost:.2f}</p>
-      <p>Reduction Factor: {RF}</p>
-      <p>Levels configured: {LEVELS}</p>
-      <p>Initial Cash: ${INITIAL_CASH}</p>
-      <p><a href="/api/levels">View full levels (JSON)</a></p>
-      
-      <form method="post" action="/api/clear-logs" style="display:inline;"><button type="submit">Clear Logs</button></form>
-      <form method="post" action="/api/clear-db" style="display:inline;"><button type="submit">Clear Database (DANGER!)</button></form>
-      <form method="post" action="/api/pause" style="display:inline;"><button type="submit">Pause Bot</
+    # SAFE STRING CONCATENATION (Prevents copy-paste line break errors)
+    html = (
+        "<html>\n"
+        "<head><title>TQQQ Bot Status</title></head>\n"
+        "<body>\n"
+        "<h2>TQQQ Bot Status</h2>\n"
+        f"{reco_alert}\n"
+        f"<p>Symbol: {SYMBOL}</p>\n"
+        f"<p>Current Price: {price}</p>\n"
+        f"<p>Actual Position Shares (Alpaca): {pos}</p>\n"
+        f"<p>Open Virtual Cost (sum): {open_cost:.2f}</p>\n"
+        f"<p>Closed Virtual Cost (sum): {closed_cost:.2f}</p>\n"
+        f"<p>Reduction Factor: {RF}</p>\n"
+        f"<p>Levels configured: {LEVELS}</p>\n"
+        f"<p>Initial Cash: ${INITIAL_CASH}</p>\n"
+        "<p><a href='/api/levels'>View full levels (JSON)</a></p>\n"
+        "<form method='post' action='/api/clear-logs' style='display:inline;'><button type='submit'>Clear Logs</button></form>\n"
+        "<form method='post' action='/api/clear-db' style='display:inline;'><button type='submit'>Clear Database (DANGER!)</button></form>\n"
+        "<form method='post' action='/api/pause' style='display:inline;'><button type='submit'>Pause Bot</button></form>\n"
+        "<form method='post' action='/api/resume' style='display:inline;'><button type='submit'>Resume Bot</button></form>\n"
+        "<h3>Reconciliation Data</h3>\n"
+        "<ul>\n"
+        f"<li>Shares Delta (Actual - Assumed): {reco_status['shares_delta']}</li>\n"
+        f"<li>Account Buying Power: ${reco_status['alpaca_cash']:.2f}</li>\n"
+        "</ul>\n"
+        "<h3>Recent logs</h3>\n"
+        f"<pre>{tail_log(200)}</pre>\n"
+        "</body>\n"
+        "</html>"
+    )
+    return web.Response(text=html, content_type='text/html')
+
+async def api_clear_db(request):
+    clear_db()
+    raise web.HTTPFound('/')
+
+async def api_status(request):
+    price = get_latest_price()
+    pos = get_actual_position_shares()
+    cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='OPEN'")
+    open_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='CLOSED'")
+    closed_count = cur.fetchone()[0]
+    data = {
+        "symbol": SYMBOL,
+        "price": price,
+        "position_shares": pos,
+        "open_virtual_lots": open_count,
+        "closed_virtual_lots": closed_count,
+        "reduction_factor": RF,
+        "paused": is_paused()
+    }
+    return web.json_response(data)
+
+async def api_levels(request):
+    cur.execute("SELECT level, virtual_shares, virtual_cost, buy_price, sell_target, status FROM virtual_lots ORDER BY level")
+    rows = cur.fetchall()
+    levels = []
+    for r in rows:
+        levels.append({
+            "level": r[0],
+            "virtual_shares": r[1],
+            "virtual_cost": r[2],
+            "buy_price": r[3],
+            "sell_target": r[4],
+            "status": r[5]
+        })
+    return web.json_response({"levels": levels})
+
+async def api_logs(request):
+    return web.Response(text=tail_log(LOG_TAIL), content_type='text/plain')
+
+async def api_clear_logs(request):
+    clear_log()
+    raise web.HTTPFound('/')
+
+async def api_pause(request):
+    set_paused(True)
+    raise web.HTTPFound('/')
+
+async def api_resume(request):
+    set_paused(False)
+    raise web.HTTPFound('/')
+
+def create_web_app():
+    app = web.Application()
+    app.router.add_get('/', handle_index)
+    app.router.add_get('/api/status', api_status)
+    app.router.add_get('/api/levels', api_levels)
+    app.router.add_post('/api/clear-logs', api_clear_logs)
+    app.router.add_post('/api/clear-db', api_clear_db)
+    app.router.add_post('/api/pause', api_pause)
+    app.router.add_post('/api/resume', api_resume)
+    return app
+
+async def main():
+    logger.info("Starting TQQQ bot v2 (alpaca-py)")
+    loop = asyncio.get_event_loop()
+    app = create_web_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', WEBUI_PORT)
+    await site.start()
+    logger.info(f"Web UI listening on port {WEBUI_PORT}")
+    await trading_loop()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down bot")
