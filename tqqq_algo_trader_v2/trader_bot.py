@@ -4,6 +4,7 @@ import os
 import sqlite3
 import time
 import logging
+import json
 from dataclasses import dataclass
 from typing import List, Optional
 from datetime import datetime, timedelta
@@ -29,23 +30,32 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("tqqq-bot")
 
 # ---------- Config ----------
-BOT_CONFIG = os.environ.get("BOT_CONFIG", "/data/tqqq-bot/config.yaml")
+# Home Assistant Add-ons store config in /data/options.json by default
+DEFAULT_CONFIG_PATH = "/data/options.json"
+BOT_CONFIG = os.environ.get("BOT_CONFIG", DEFAULT_CONFIG_PATH)
 LEDGER_DB = os.environ.get("LEDGER_DB", "/data/tqqq-bot/ledger_v2.db")
 
+cfg = {}
 try:
+    # Try loading as JSON first (Standard Home Assistant)
     with open(BOT_CONFIG, 'r') as f:
-        cfg = yaml.safe_load(f)
-except FileNotFoundError:
-    logger.error(f"Config file not found at {BOT_CONFIG}")
-    cfg = {}
-except Exception:
-    logger.exception("Error loading config file")
-    cfg = {}
+        cfg = json.load(f)
+        logger.info(f"Loaded config from {BOT_CONFIG}")
+except (FileNotFoundError, json.JSONDecodeError):
+    # Fallback to YAML if JSON fails (Backward compatibility/Local testing)
+    try:
+        with open(BOT_CONFIG, 'r') as f:
+            cfg = yaml.safe_load(f)
+            logger.info(f"Loaded YAML config from {BOT_CONFIG}")
+    except FileNotFoundError:
+        logger.error(f"Config file not found at {BOT_CONFIG}. Using script defaults.")
+    except Exception:
+        logger.exception("Error loading config file")
 
 # --- Environment Configuration ---
-ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY") 
-ALPACA_API_SECRET = os.environ.get("ALPACA_SECRET_KEY")
-USE_PAPER = cfg.get("alpaca", {}).get("use_paper", True)
+ALPACA_API_KEY = cfg.get("alpaca_api_key") or os.environ.get("ALPACA_API_KEY")
+ALPACA_API_SECRET = cfg.get("alpaca_secret_key") or os.environ.get("ALPACA_SECRET_KEY")
+USE_PAPER = cfg.get("use_paper", True)
 
 SYMBOL = cfg.get("symbol", "TQQQ")
 RF = float(cfg.get("reduction_factor", 0.95))
@@ -54,8 +64,10 @@ INITIAL_CASH = float(cfg.get("initial_cash", 250000))
 POLL_MS = int(cfg.get("poll_interval_ms", 500))
 MIN_ORDER_SHARES = int(cfg.get("min_order_shares", 1))
 MAX_POSITION_SHARES = int(cfg.get("max_position_shares", 200000))
-WEBUI_PORT = int(cfg.get("webui", {}).get("port", 8080))
-LOG_TAIL = int(cfg.get("log_tail_lines", 200))
+WEBUI_PORT = int(cfg.get("webui_port", 8080))
+LOG_TAIL = 200 # Default if not in config
+
+logger.info(f"Configuration Loaded: Symbol={SYMBOL}, Cash={INITIAL_CASH}, RF={RF}, Levels={LEVELS}")
 
 # ---------- Alpaca Client Setup (UPDATED) ----------
 api: Optional[TradingClient] = None
@@ -116,7 +128,7 @@ class VirtualLot:
     status: str  # PENDING, ORDER_SENT, OPEN, or CLOSED
 
 # ---------- Utility functions ----------
-def tail_log(n: int = LOG_FILE) -> str:
+def tail_log(n: int = LOG_TAIL) -> str:
     try:
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()
@@ -532,9 +544,9 @@ async def handle_index(request):
       <p>Closed Virtual Cost (sum): {closed_cost:.2f}</p>
       <p>Reduction Factor: {RF}</p>
       <p>Levels configured: {LEVELS}</p>
+      <p>Initial Cash: ${INITIAL_CASH}</p>
       <p><a href="/api/levels">View full levels (JSON)</a></p>
       
-      <!-- Buttons for control and clearing -->
       <form method="post" action="/api/clear-logs" style="display:inline;"><button type="submit">Clear Logs</button></form>
       <form method="post" action="/api/clear-db" style="display:inline;"><button type="submit">Clear Database (DANGER!)</button></form>
       <form method="post" action="/api/pause" style="display:inline;"><button type="submit">Pause Bot</button></form>
@@ -637,4 +649,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Shutting down bot")
-
