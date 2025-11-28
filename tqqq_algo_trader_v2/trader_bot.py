@@ -244,7 +244,10 @@ def seed_virtual_ledger_if_empty():
         logger.info("Ledger is empty. Ready for initial buy sequence.")
         
 def load_open_virtual_lots() -> List[VirtualLot]:
-    cur.execute("SELECT level, virtual_shares, virtual_cost, buy_price, sell_target, status FROM virtual_lots WHERE status='OPEN' ORDER BY level")
+    cur.execute(
+        "SELECT level, virtual_shares, virtual_cost, buy_price, sell_target, status "
+        "FROM virtual_lots WHERE status='OPEN' ORDER BY level"
+    )
     return [VirtualLot(*r) for r in cur.fetchall()]
 
 # ---------- Alpaca helpers (UPDATED for alpaca-py) ----------
@@ -300,8 +303,11 @@ def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
 
     try:
         order = api.submit_order(order_data=req)
-        cur.execute("INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) VALUES (?,?,?,?,?,?)",
-                    (str(order.id), side_str, qty, price, str(order.status), int(time.time())))
+        cur.execute(
+            "INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (str(order.id), side_str, qty, price, str(order.status), int(time.time()))
+        )
         conn.commit()
         logger.info(f"Submitted LIMIT {side_str} order qty={qty} @ ${price:.2f}")
         return str(order.id)
@@ -314,7 +320,10 @@ def reconcile_orders():
         return
     try:
         # Check all orders not yet finalized
-        cur.execute("SELECT id, alpaca_id FROM orders WHERE status NOT IN ('filled','canceled','expired')")
+        cur.execute(
+            "SELECT id, alpaca_id FROM orders "
+            "WHERE status NOT IN ('filled','canceled','expired')"
+        )
         rows = cur.fetchall()
         for rid, aid in rows:
             try:
@@ -433,7 +442,10 @@ async def trading_loop():
             # --- RUNNING LOGIC ---
             
             # 1. SELL logic: Check all lots currently held ('OPEN')
-            cur.execute("SELECT level, virtual_shares, sell_target FROM virtual_lots WHERE status='OPEN' ORDER BY level")
+            cur.execute(
+                "SELECT level, virtual_shares, sell_target FROM virtual_lots "
+                "WHERE status='OPEN' ORDER BY level"
+            )
             open_lots = cur.fetchall()
             
             for level, vshares, sell_target in open_lots:
@@ -451,4 +463,108 @@ async def trading_loop():
                             conn.commit()
 
             # 2. BUY logic: Check all lots waiting to be bought ('PENDING')
-            cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_
+            cur.execute(
+                "SELECT level, virtual_shares, buy_price FROM virtual_lots "
+                "WHERE status='PENDING' ORDER BY level DESC"
+            )
+            pending_rows = cur.fetchall()
+            
+            
+            # If no PENDING lots exist, and no lots are ORDER_SENT, calculate and create the next PENDING lot (Level N+1)
+            cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='ORDER_SENT'")
+            orders_sent_count = cur.fetchone()[0]
+            
+            if not pending_rows and orders_sent_count == 0:
+                
+                cur.execute("SELECT MAX(level) FROM virtual_lots")
+                max_level = cur.fetchone()[0] or 0
+                
+                cur.execute("SELECT buy_price FROM virtual_lots WHERE level=1")
+                anchor_result = cur.fetchone()
+                anchor_price = anchor_result[0] if anchor_result else 0.0 
+                
+                if anchor_price > 0:
+                    qty, buy_target_price = compute_allocation_levels(anchor_price, max_level, INITIAL_CASH, RF, LEVELS)
+
+                    if qty > 0 and buy_target_price > 0:
+                        
+                        sell_target = round(buy_target_price * 1.01, 8) 
+                        
+                        cur.execute("""INSERT INTO virtual_lots
+                            (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at)
+                            VALUES (?,?,?,?,?,?,?)""",
+                            (max_level + 1, qty, buy_target_price*qty, buy_target_price, sell_target, "PENDING", int(time.time())))
+                        conn.commit()
+                        
+                        logger.info(f"Prepared next pending lot: Level {max_level + 1} @ ${buy_target_price:.2f}")
+
+            # Re-fetch PENDING rows now that the new one might be created
+            cur.execute(
+                "SELECT level, virtual_shares, buy_price FROM virtual_lots "
+                "WHERE status='PENDING' ORDER BY level DESC"
+            )
+            pending_rows = cur.fetchall()
+
+            actual_shares = reconciliation_status['actual_shares'] 
+            
+            for level, vshares, buy_price in pending_rows:
+                # We only place a buy order IF the current price is at or below the target price 
+                if price <= buy_price:
+                    if actual_shares + vshares > MAX_POSITION_SHARES:
+                        logger.info("Safety cap would be exceeded; skipping buy for level %s", level)
+                        continue
+                        
+                    qty = int(vshares)
+                    if qty < MIN_ORDER_SHARES:
+                        continue
+                        
+                    logger.info("BUY TRIGGER level=%s buy_price=%s price=%s qty=%s", level, buy_price, price, qty)
+                    
+                    order_id = submit_order("buy", qty, buy_price)
+                    if order_id:
+                        # CRITICAL: Move lot to ORDER_SENT status immediately to prevent duplicate orders
+                        cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (order_id, level))
+                        conn.commit()
+            
+        except Exception:
+            logger.exception("Exception in trading loop")
+            
+        await asyncio.sleep(POLL_MS/1000)
+
+# ---------- Web UI (aiohttp) ----------
+async def handle_index(request):
+    price = get_latest_price()
+    pos = get_actual_position_shares()
+    cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='OPEN'")
+    r = cur.fetchone()
+    open_cost = r[0] if r and r[0] else 0.0
+    
+    cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='CLOSED'")
+    r = cur.fetchone()
+    closed_cost = r[0] if r and r[0] else 0.0
+    
+    # Get Reconciliation Status
+    reco_status = get_reconciliation_status()
+    reco_alert = ""
+    if not reco_status['reconciled']:
+        reco_alert = f"""<p style='color:red; font-weight:bold;'>WARNING: Share Mismatch! DB ({reco_status['assumed_shares']}) != Alpaca ({reco_status['actual_shares']})</p>"""
+    
+    html = f"""
+    <html>
+    <head><title>TQQQ Bot Status</title></head>
+    <body>
+      <h2>TQQQ Bot Status</h2>
+      {reco_alert}
+      <p>Symbol: {SYMBOL}</p>
+      <p>Current Price: {price}</p>
+      <p>Actual Position Shares (Alpaca): {pos}</p>
+      <p>Open Virtual Cost (sum): {open_cost:.2f}</p>
+      <p>Closed Virtual Cost (sum): {closed_cost:.2f}</p>
+      <p>Reduction Factor: {RF}</p>
+      <p>Levels configured: {LEVELS}</p>
+      <p>Initial Cash: ${INITIAL_CASH}</p>
+      <p><a href="/api/levels">View full levels (JSON)</a></p>
+      
+      <form method="post" action="/api/clear-logs" style="display:inline;"><button type="submit">Clear Logs</button></form>
+      <form method="post" action="/api/clear-db" style="display:inline;"><button type="submit">Clear Database (DANGER!)</button></form>
+      <form method="post" action="/api/pause" style="display:inline;"><button type="submit">Pause Bot</
