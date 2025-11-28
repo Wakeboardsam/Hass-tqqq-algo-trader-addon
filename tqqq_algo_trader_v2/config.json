@@ -20,7 +20,7 @@
     "symbol": "TQQQ",
     "reduction_factor": 0.95,
     "levels": 88,
-    "initial_cash": "",
+    "initial_cash": "1",
     "poll_interval_ms": 500,
     "min_order_shares": 1,
     "max_position_shares": 200000,
