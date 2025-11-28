@@ -8,6 +8,7 @@ import json
 from dataclasses import dataclass
 from typing import List, Optional
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo # Standard in Python 3.9+
 
 import yaml
 from aiohttp import web
@@ -33,16 +34,7 @@ if not os.path.exists(CONFIG_DIR):
         print(f"Could not create {CONFIG_DIR}, falling back to /data: {e}")
         CONFIG_DIR = "/data/tqqq-bot"
 
-# ---------- Logging ----------
-LOG_FILE = os.path.join(CONFIG_DIR, "bot.log")
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s: %(message)s",
-                    handlers=[logging.FileHandler(LOG_FILE),
-                              logging.StreamHandler()])
-
-logger = logging.getLogger("tqqq-bot")
-
-# ---------- Config ----------
+# ---------- Config Loading ----------
 BOT_CONFIG = "/data/options.json"
 LEDGER_DB = os.path.join(CONFIG_DIR, "ledger_v2.db")
 
@@ -50,16 +42,44 @@ cfg = {}
 try:
     with open(BOT_CONFIG, 'r') as f:
         cfg = json.load(f)
-        logger.info(f"Loaded config from {BOT_CONFIG}")
+        # We print here because logger isn't set up yet
+        print(f"Loaded config from {BOT_CONFIG}")
 except (FileNotFoundError, json.JSONDecodeError):
     try:
         with open(BOT_CONFIG, 'r') as f:
             cfg = yaml.safe_load(f)
-            logger.info(f"Loaded YAML config from {BOT_CONFIG}")
-    except FileNotFoundError:
-        logger.error(f"Config file not found at {BOT_CONFIG}. Using script defaults.")
     except Exception:
-        logger.exception("Error loading config file")
+        pass
+
+# ---------- TIMEZONE SETUP (Dynamic) ----------
+# Read from Config Tab, default to Denver if missing
+TZ_STR = cfg.get("timezone", "America/Denver")
+try:
+    MY_TIMEZONE = ZoneInfo(TZ_STR)
+except Exception:
+    print(f"Invalid timezone {TZ_STR}, defaulting to UTC")
+    MY_TIMEZONE = ZoneInfo("UTC")
+
+def local_time(*args):
+    """Helper to convert UTC to User's Configured Timezone for Logging"""
+    utc_dt = datetime.now(datetime.timezone.utc)
+    my_dt = utc_dt.astimezone(MY_TIMEZONE)
+    return my_dt.timetuple()
+
+# ---------- Logging Setup ----------
+LOG_FILE = os.path.join(CONFIG_DIR, "bot.log")
+
+# Apply the dynamic timezone converter to the logger
+logging.Formatter.converter = local_time
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s: %(message)s",
+                    datefmt="%H:%M:%S", # Military Time
+                    handlers=[logging.FileHandler(LOG_FILE),
+                              logging.StreamHandler()])
+
+logger = logging.getLogger("tqqq-bot")
+logger.info(f"Timezone set to: {TZ_STR}")
 
 # --- Environment Configuration ---
 ALPACA_API_KEY = cfg.get("alpaca_api_key") or os.environ.get("ALPACA_API_KEY")
@@ -233,7 +253,6 @@ def get_reconciliation_status() -> dict:
         cur.execute("SELECT SUM(virtual_shares) FROM virtual_lots WHERE status='OPEN'")
         open_shares = cur.fetchone()[0] or 0
         
-        # Count shares from pending orders to prevent race-condition mismatch
         pending_shares = 0
         if api:
             cur.execute("SELECT alpaca_order_id FROM virtual_lots WHERE status='ORDER_SENT'")
@@ -264,6 +283,9 @@ def get_reconciliation_status() -> dict:
 
     reconciled = (actual_shares == assumed_shares)
     
+    # Use the dynamic timezone for the dashboard clock
+    now_mt = datetime.now(datetime.timezone.utc).astimezone(MY_TIMEZONE)
+    
     return {
         "reconciled": reconciled,
         "actual_shares": actual_shares,
@@ -271,7 +293,7 @@ def get_reconciliation_status() -> dict:
         "shares_delta": actual_shares - assumed_shares,
         "total_db_allocation": round(total_db_allocation, 2),
         "alpaca_cash": round(account_cash, 2),
-        "timestamp": datetime.now().strftime("%H:%M:%S")
+        "timestamp": now_mt.strftime("%H:%M:%S")
     }
 
 # ---------- Smart Startup Sync ----------
@@ -377,10 +399,7 @@ def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
     )
     try:
         order = api.submit_order(order_data=req)
-        
-        # CRITICAL FIX: Use .value to store clean string status
         status_str = order.status.value if hasattr(order.status, 'value') else str(order.status)
-        
         cur.execute(
             "INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) VALUES (?,?,?,?,?,?)",
             (str(order.id), side_str, qty, price, status_str, int(time.time()))
@@ -400,31 +419,23 @@ def reconcile_orders():
         for rid, aid in rows:
             try:
                 o = api.get_order_by_id(aid)
-                
-                # CRITICAL FIX: Convert Enum status to plain string for comparison
                 order_status = o.status.value if hasattr(o.status, 'value') else str(o.status)
-
                 cur.execute("UPDATE orders SET status=? WHERE id=?", (order_status, rid))
 
-                # Now exact string matching works correctly
                 if order_status == 'filled':
-                    # Determine lot level
                     cur.execute("SELECT level FROM virtual_lots WHERE alpaca_order_id=?", (aid,))
                     lot_level_result = cur.fetchone()
                     lot_level = lot_level_result[0] if lot_level_result else None
                     
                     if lot_level is not None:
-                        # Determine side from order table
                         cur.execute("SELECT side FROM orders WHERE alpaca_id=?", (aid,))
                         order_side_row = cur.fetchone()
-                        
                         if order_side_row and order_side_row[0] == 'buy':
                             cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE level=?", (lot_level,))
                             logger.info(f"Lot Level {lot_level} moved to OPEN (Filled).")
                         elif order_side_row and order_side_row[0] == 'sell':
                             cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (lot_level,))
                             logger.info(f"Lot Level {lot_level} moved to CLOSED (Sold).")
-
             except Exception:
                 pass
         conn.commit()
@@ -523,7 +534,10 @@ async def trading_loop():
                         logger.info(f"SELL TRIGGER level={level} target={sell_target} price={price}")
                         order_id = submit_order("sell", qty, sell_target)
                         if order_id:
-                            cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (order_id, level))
+                            cur.execute(
+                                "UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", 
+                                (order_id, level)
+                            )
                             conn.commit()
 
             # 2. BUY logic
