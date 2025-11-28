@@ -1,0 +1,10 @@
+symbol: "TQQQ"
+reduction_factor: 0.955
+levels: 88
+initial_cash: 100000
+poll_interval_ms: 1000
+min_order_shares: 1
+max_position_shares: 200000
+webui_port: 8081
+timezone: "America/Denver"
+manual_market_price: 100.00
