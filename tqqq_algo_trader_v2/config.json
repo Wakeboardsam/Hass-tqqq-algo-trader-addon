@@ -1,6 +1,6 @@
 {
   "name": "TQQQ Grid Bot v2",
-  "version": "0.1.53",
+  "version": "0.1.54",
   "slug": "tqqq_algo_trader_v2",
   "description": "Alpaca Grid Bot using a virtual ledger with Web UI",
   "arch": ["amd64", "armv7", "aarch64", "armhf"],
@@ -18,14 +18,15 @@
     "alpaca_secret_key": "",
     "use_paper": true,
     "symbol": "TQQQ",
-    "reduction_factor": 0.95,
+    "reduction_factor": 0.955,
     "levels": 88,
-    "initial_cash": "1",
+    "initial_cash": 100000,
     "poll_interval_ms": 500,
     "min_order_shares": 1,
     "max_position_shares": 200000,
     "webui_enabled": true,
-    "webui_port": 8080
+    "webui_port": 8080,
+    "timezone": "America/Denver"
   },
   "schema": {
     "alpaca_api_key": "str",
@@ -39,8 +40,8 @@
     "min_order_shares": "int",
     "max_position_shares": "int",
     "webui_enabled": "bool",
-    "webui_port": "int"
+    "webui_port": "int",
+    "timezone": "str"
   },
   "host_network": false
 }
-
