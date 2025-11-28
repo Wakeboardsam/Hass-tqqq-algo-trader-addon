@@ -369,7 +369,11 @@ async def trading_loop():
             if cur.fetchone()[0] == 0:
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
                 target_price = price 
-                aggressive_limit_price = round(target_price + 0.01, 2)
+                
+                # UPDATE: 0.5% (Half Percent) Limit Buffer to guarantee immediate fill
+                # This ensures we cross the spread (Ask Price) without overpaying.
+                aggressive_limit_price = round(target_price * 1.005, 2)
+                
                 qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
 
                 if qty > 0 and qty <= MAX_POSITION_SHARES:
