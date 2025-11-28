@@ -20,8 +20,21 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
+# ---------- PERSISTENCE SETUP (UPDATED) ----------
+# We now store the DB in /config/tqqq-bot/ so it survives restarts/reinstalls.
+# In Home Assistant, /config is the standard persistent volume.
+CONFIG_DIR = "/config/tqqq-bot"
+if not os.path.exists(CONFIG_DIR):
+    try:
+        os.makedirs(CONFIG_DIR)
+        print(f"Created persistent directory: {CONFIG_DIR}")
+    except Exception as e:
+        print(f"Could not create {CONFIG_DIR}, falling back to /data: {e}")
+        CONFIG_DIR = "/data/tqqq-bot"
+
 # ---------- Logging ----------
-LOG_FILE = os.environ.get("LOG_FILE", "/data/tqqq-bot/bot.log")
+# Log file also moves to persistence so you can debug past runs
+LOG_FILE = os.path.join(CONFIG_DIR, "bot.log")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s: %(message)s",
                     handlers=[logging.FileHandler(LOG_FILE),
@@ -32,7 +45,8 @@ logger = logging.getLogger("tqqq-bot")
 # ---------- Config ----------
 # CRITICAL FIX: Force the script to read the Home Assistant options file.
 BOT_CONFIG = "/data/options.json"
-LEDGER_DB = os.environ.get("LEDGER_DB", "/data/tqqq-bot/ledger_v2.db")
+# Database now lives in the secure /config folder
+LEDGER_DB = os.path.join(CONFIG_DIR, "ledger_v2.db")
 
 cfg = {}
 try:
@@ -67,6 +81,7 @@ WEBUI_PORT = int(cfg.get("webui_port", 8080))
 LOG_TAIL = 200
 
 logger.info(f"Configuration Loaded: Symbol={SYMBOL}, Cash={INITIAL_CASH}, RF={RF}, Levels={LEVELS}")
+logger.info(f"Persistence Enabled: Database and Logs saved to {CONFIG_DIR}")
 
 # ---------- Alpaca Client Setup ----------
 api: Optional[TradingClient] = None
@@ -371,7 +386,6 @@ async def trading_loop():
                 target_price = price 
                 
                 # UPDATE: 0.5% (Half Percent) Limit Buffer to guarantee immediate fill
-                # This ensures we cross the spread (Ask Price) without overpaying.
                 aggressive_limit_price = round(target_price * 1.005, 2)
                 
                 qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
@@ -491,6 +505,7 @@ async def handle_index(request):
         f"<p>Reduction Factor: {RF}</p>\n"
         f"<p>Levels configured: {LEVELS}</p>\n"
         f"<p>Initial Cash: ${INITIAL_CASH}</p>\n"
+        f"<p>Database Location: {CONFIG_DIR}</p>\n"
         "<p><a href='/api/levels'>View full levels (JSON)</a></p>\n"
         "<form method='post' action='/api/clear-logs' style='display:inline;'><button type='submit'>Clear Logs</button></form>\n"
         "<form method='post' action='/api/clear-db' style='display:inline;'><button type='submit'>Clear Database (DANGER!)</button></form>\n"
