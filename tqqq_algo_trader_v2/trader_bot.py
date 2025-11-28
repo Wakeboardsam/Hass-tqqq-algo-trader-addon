@@ -7,8 +7,19 @@ import logging
 import json
 from dataclasses import dataclass
 from typing import List, Optional
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo # Standard in Python 3.9+
+# CRITICAL FIX: Import timezone explicitly
+from datetime import datetime, timedelta, timezone
+
+# --- Timezone Support ---
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    # Fallback for older Python versions
+    class ZoneInfo:
+        def __init__(self, key): pass
+        def utcoffset(self, dt): return timedelta(hours=-7)
+        def tzname(self, dt): return "MST"
+        def dst(self, dt): return timedelta(0)
 
 import yaml
 from aiohttp import web
@@ -42,7 +53,6 @@ cfg = {}
 try:
     with open(BOT_CONFIG, 'r') as f:
         cfg = json.load(f)
-        # We print here because logger isn't set up yet
         print(f"Loaded config from {BOT_CONFIG}")
 except (FileNotFoundError, json.JSONDecodeError):
     try:
@@ -52,17 +62,17 @@ except (FileNotFoundError, json.JSONDecodeError):
         pass
 
 # ---------- TIMEZONE SETUP (Dynamic) ----------
-# Read from Config Tab, default to Denver if missing
 TZ_STR = cfg.get("timezone", "America/Denver")
 try:
     MY_TIMEZONE = ZoneInfo(TZ_STR)
 except Exception:
     print(f"Invalid timezone {TZ_STR}, defaulting to UTC")
-    MY_TIMEZONE = ZoneInfo("UTC")
+    MY_TIMEZONE = timezone.utc
 
 def local_time(*args):
     """Helper to convert UTC to User's Configured Timezone for Logging"""
-    utc_dt = datetime.now(datetime.timezone.utc)
+    # FIX: Use timezone.utc directly
+    utc_dt = datetime.now(timezone.utc)
     my_dt = utc_dt.astimezone(MY_TIMEZONE)
     return my_dt.timetuple()
 
@@ -283,8 +293,8 @@ def get_reconciliation_status() -> dict:
 
     reconciled = (actual_shares == assumed_shares)
     
-    # Use the dynamic timezone for the dashboard clock
-    now_mt = datetime.now(datetime.timezone.utc).astimezone(MY_TIMEZONE)
+    # FIX: Use timezone.utc directly
+    now_mt = datetime.now(timezone.utc).astimezone(MY_TIMEZONE)
     
     return {
         "reconciled": reconciled,
