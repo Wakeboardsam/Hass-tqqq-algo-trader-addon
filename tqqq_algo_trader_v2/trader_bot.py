@@ -14,15 +14,13 @@ from aiohttp import web
 
 # ---------- Alpaca-py Imports (UPDATED) ----------
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import LimitOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-# ---------- PERSISTENCE SETUP (UPDATED) ----------
-# We now store the DB in /config/tqqq-bot/ so it survives restarts/reinstalls.
-# In Home Assistant, /config is the standard persistent volume.
+# ---------- PERSISTENCE SETUP ----------
 CONFIG_DIR = "/config/tqqq-bot"
 if not os.path.exists(CONFIG_DIR):
     try:
@@ -33,7 +31,6 @@ if not os.path.exists(CONFIG_DIR):
         CONFIG_DIR = "/data/tqqq-bot"
 
 # ---------- Logging ----------
-# Log file also moves to persistence so you can debug past runs
 LOG_FILE = os.path.join(CONFIG_DIR, "bot.log")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s: %(message)s",
@@ -43,19 +40,15 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("tqqq-bot")
 
 # ---------- Config ----------
-# CRITICAL FIX: Force the script to read the Home Assistant options file.
 BOT_CONFIG = "/data/options.json"
-# Database now lives in the secure /config folder
 LEDGER_DB = os.path.join(CONFIG_DIR, "ledger_v2.db")
 
 cfg = {}
 try:
-    # Try loading as JSON first (Standard Home Assistant)
     with open(BOT_CONFIG, 'r') as f:
         cfg = json.load(f)
         logger.info(f"Loaded config from {BOT_CONFIG}")
 except (FileNotFoundError, json.JSONDecodeError):
-    # Fallback to YAML if JSON fails
     try:
         with open(BOT_CONFIG, 'r') as f:
             cfg = yaml.safe_load(f)
@@ -215,6 +208,67 @@ def get_reconciliation_status() -> dict:
         "alpaca_cash": round(account_cash, 2)
     }
 
+# ---------- New Feature: Smart Startup Sync ----------
+def sync_alpaca_state():
+    """On startup, checks Alpaca for open orders. If DB is empty, imports them."""
+    if not api: 
+        return
+
+    logger.info("--- SMART SYNC: Checking Alpaca for existing state ---")
+    
+    # Check if DB is empty
+    cur.execute("SELECT COUNT(1) FROM virtual_lots")
+    if cur.fetchone()[0] > 0:
+        logger.info("Database is not empty. Skipping import to avoid conflicts.")
+        return
+
+    try:
+        # Get all OPEN orders for TQQQ
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[SYMBOL])
+        orders = api.get_orders(req)
+        
+        if not orders:
+            logger.info("No open orders found on Alpaca. Clean start.")
+            return
+
+        logger.info(f"Found {len(orders)} OPEN orders on Alpaca. importing...")
+
+        for o in orders:
+            # We found an order! 
+            # Since the DB is empty, we must assume this is our "Anchor" or a recovered lot.
+            # For simplicity in this recovery logic, if we find a BUY, we assign it Level 1.
+            
+            if o.side == OrderSide.BUY:
+                qty = int(float(o.qty))
+                price = float(o.limit_price) if o.limit_price else 0.0
+                
+                # Assume Level 1 for the first recovered buy order
+                # (In a complex scenario we might try to guess the level, but L1 is safest for Anchor recovery)
+                cur.execute("SELECT MAX(level) FROM virtual_lots")
+                current_max = cur.fetchone()[0]
+                new_level = 1 if current_max is None else current_max + 1
+                
+                sell_target = round(price * 1.01, 8) # Estimated target
+                
+                logger.info(f"IMPORTING Order {o.id}: BUY {qty} @ {price}. Assigning to Level {new_level}.")
+                
+                # Insert into DB as ORDER_SENT
+                cur.execute("""INSERT OR IGNORE INTO virtual_lots
+                    (level, virtual_shares, virtual_cost, buy_price, sell_target, status, created_at, alpaca_order_id)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (new_level, qty, price*qty, price, sell_target, "ORDER_SENT", int(time.time()), str(o.id)))
+                
+                # Also log in orders table
+                cur.execute("""INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) 
+                    VALUES (?,?,?,?,?,?)""",
+                    (str(o.id), "buy", qty, price, "new", int(time.time())))
+                
+        conn.commit()
+        logger.info("--- SMART SYNC COMPLETE: State restored from Alpaca ---")
+
+    except Exception as e:
+        logger.error(f"Smart Sync failed: {e}")
+
 # ---------- Reduction-factor allocation ----------
 def compute_allocation_levels(anchor_price: float, current_level: int, starting_cash: float, rf: float, total_levels: int) -> tuple[int, float]:
     next_level = current_level + 1
@@ -353,6 +407,14 @@ def set_paused(val: bool):
 # ---------- Core trading loop ----------
 async def trading_loop():
     logger.info("Starting trading loop")
+    
+    # NEW STEP 1: Sync with Alpaca BEFORE doing anything else
+    try:
+        sync_alpaca_state()
+    except Exception as e:
+        logger.error(f"Error during startup sync: {e}")
+
+    # STEP 2: Standard checks
     try:
         seed_virtual_ledger_if_empty()
     except Exception as e:
@@ -380,12 +442,13 @@ async def trading_loop():
             actual_shares = reconciliation_status['actual_shares']
             
             # --- STARTUP LOGIC ---
+            # Check if ledger is empty (It won't be if sync_alpaca_state worked!)
             cur.execute("SELECT COUNT(1) FROM virtual_lots")
             if cur.fetchone()[0] == 0:
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
                 target_price = price 
                 
-                # UPDATE: 0.5% (Half Percent) Limit Buffer to guarantee immediate fill
+                # UPDATE: 0.5% (Half Percent) Limit Buffer
                 aggressive_limit_price = round(target_price * 1.005, 2)
                 
                 qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
