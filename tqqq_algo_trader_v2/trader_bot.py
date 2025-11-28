@@ -69,14 +69,17 @@ USE_PAPER = cfg.get("use_paper", True)
 SYMBOL = cfg.get("symbol", "TQQQ")
 RF = float(cfg.get("reduction_factor", 0.95))
 LEVELS = int(cfg.get("levels", 88))
-INITIAL_CASH = float(cfg.get("initial_cash", 250000))
+# NOTE: INITIAL_CASH here is only for the VERY FIRST run. 
+# Subsequent runs use the database value.
+CONFIG_INITIAL_CASH = float(cfg.get("initial_cash", 250000))
+
 POLL_MS = int(cfg.get("poll_interval_ms", 500))
 MIN_ORDER_SHARES = int(cfg.get("min_order_shares", 1))
 MAX_POSITION_SHARES = int(cfg.get("max_position_shares", 200000))
 WEBUI_PORT = int(cfg.get("webui_port", 8080))
 LOG_TAIL = 200
 
-logger.info(f"Configuration Loaded: Symbol={SYMBOL}, Cash={INITIAL_CASH}, RF={RF}, Levels={LEVELS}")
+logger.info(f"Configuration Loaded: Symbol={SYMBOL}, Config Cash={CONFIG_INITIAL_CASH}, RF={RF}")
 logger.info(f"Persistence Enabled: Database and Logs saved to {CONFIG_DIR}")
 
 # ---------- Alpaca Client Setup ----------
@@ -136,14 +139,12 @@ class VirtualLot:
     sell_target: float
     status: str
 
-# ---------- Utility functions (UPDATED LOGIC) ----------
+# ---------- Utility functions ----------
 def tail_log(n: int = LOG_TAIL) -> str:
     try:
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()
-        # Grab the last 'n' lines
         last_lines = lines[-n:]
-        # Reverse them so the newest line is at the top
         last_lines.reverse()
         return "".join(last_lines)
     except Exception:
@@ -159,6 +160,7 @@ def clear_log():
         return False
 
 def clear_db():
+    """Manual Hard Reset via Button (Wipes everything)"""
     try:
         cur.executescript("""
             DROP TABLE IF EXISTS virtual_lots;
@@ -166,7 +168,7 @@ def clear_db():
             DROP TABLE IF EXISTS meta;
         """)
         conn.commit()
-        logger.info("Database (virtual_lots, orders, meta) DROPPED via web UI.")
+        logger.info("Database DROPPED via web UI (Hard Reset).")
         return True
     except Exception as e:
         logger.exception("Failed clearing database")
@@ -178,13 +180,63 @@ def write_meta(key: str, val: str):
 
 def read_meta(key: str) -> Optional[str]:
     try:
-        cur.execute("SELECT val FROM meta WHERE key='paused'")
+        cur.execute("SELECT val FROM meta WHERE key=?", (key,))
         v = cur.fetchone()
         return v[0] if v else None
     except sqlite3.OperationalError:
-        return "0" 
+        return None
 
-# --- Feature: Reconciliation Check ---
+def is_paused() -> bool:
+    val = read_meta('paused')
+    return val == "1"
+
+def set_paused(val: bool):
+    write_meta("paused", "1" if val else "0")
+
+# ---------- Dynamic Cash Management ----------
+def get_dynamic_initial_cash() -> float:
+    """Returns the persistent cash value from DB, or config default if fresh."""
+    val = read_meta('campaign_starting_equity')
+    if val:
+        return float(val)
+    
+    # If starting fresh, save the config value as the baseline
+    write_meta('campaign_starting_equity', str(CONFIG_INITIAL_CASH))
+    return CONFIG_INITIAL_CASH
+
+# ---------- P/L Tracking ----------
+def get_season_stats() -> dict:
+    """Calculates P/L for the current active campaign/season."""
+    try:
+        # Get Current Equity from Alpaca
+        equity = 0.0
+        if api:
+            acct = api.get_account()
+            equity = float(acct.equity)
+        
+        # Get Starting Equity for this Campaign
+        start_equity = get_dynamic_initial_cash()
+        
+        # Get Last Season's P/L
+        last_pl = read_meta('last_season_pl')
+        last_pl_val = float(last_pl) if last_pl else 0.0
+        
+        return {
+            "current_equity": equity,
+            "starting_equity": start_equity,
+            "current_pl": equity - start_equity,
+            "last_season_pl": last_pl_val
+        }
+    except Exception as e:
+        logger.error(f"Error getting season stats: {e}")
+        return {
+            "current_equity": 0.0,
+            "starting_equity": 0.0,
+            "current_pl": 0.0,
+            "last_season_pl": 0.0
+        }
+
+# ---------- Reconciliation Check ----------
 def get_reconciliation_status() -> dict:
     actual_shares = get_actual_position_shares()
     try:
@@ -216,32 +268,23 @@ def get_reconciliation_status() -> dict:
         "timestamp": datetime.now().strftime("%H:%M:%S")
     }
 
-# ---------- New Feature: Smart Startup Sync ----------
+# ---------- Smart Startup Sync ----------
 def sync_alpaca_state():
-    """On startup, checks Alpaca for open orders. If DB is empty, imports them."""
-    if not api: 
-        return
-
+    if not api: return
     logger.info("--- SMART SYNC: Checking Alpaca for existing state ---")
-    
-    # Check if DB is empty
     cur.execute("SELECT COUNT(1) FROM virtual_lots")
     if cur.fetchone()[0] > 0:
-        logger.info("Database is not empty. Skipping import to avoid conflicts.")
+        logger.info("Database is not empty. Skipping import.")
         return
 
     try:
-        # Get all OPEN orders for TQQQ
         req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[SYMBOL])
         orders = api.get_orders(req)
-        
         if not orders:
-            logger.info("No open orders found on Alpaca. Clean start.")
+            logger.info("No open orders found. Clean start.")
             return
 
-        logger.info(f"Found {len(orders)} OPEN orders on Alpaca. importing...")
-        
-        # Sort orders by price descending (highest buy price = Level 1)
+        logger.info(f"Found {len(orders)} OPEN orders. Importing...")
         orders.sort(key=lambda x: float(x.limit_price) if x.limit_price else 0, reverse=True)
 
         for i, o in enumerate(orders):
@@ -265,10 +308,7 @@ def sync_alpaca_state():
                 cur.execute("""INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) 
                     VALUES (?,?,?,?,?,?)""",
                     (str(o.id), "buy", qty, price, "new", int(time.time())))
-                
         conn.commit()
-        logger.info("--- SMART SYNC COMPLETE: State restored from Alpaca ---")
-
     except Exception as e:
         logger.error(f"Smart Sync failed: {e}")
 
@@ -291,31 +331,18 @@ def seed_virtual_ledger_if_empty():
     cur.execute("SELECT COUNT(1) FROM virtual_lots")
     if cur.fetchone()[0] == 0:
         logger.info("Ledger is empty. Ready for initial buy sequence.")
-        
-def load_open_virtual_lots() -> List[VirtualLot]:
-    cur.execute(
-        "SELECT level, virtual_shares, virtual_cost, buy_price, sell_target, status "
-        "FROM virtual_lots WHERE status='OPEN' ORDER BY level"
-    )
-    return [VirtualLot(*r) for r in cur.fetchall()]
 
 # ---------- Alpaca helpers ----------
 def get_latest_price() -> Optional[float]:
-    if not data_api:
-        return None
+    if not data_api: return None
     try:
         req = StockLatestTradeRequest(symbol_or_symbols=[SYMBOL])
         trade = data_api.get_stock_latest_trade(req)
         return float(trade[SYMBOL].price)
     except Exception:
-        logger.warning("Failed to fetch latest trade price. Falling back to bar close.")
-
+        pass
     try:
-        req = StockBarsRequest(
-            symbol_or_symbols=[SYMBOL],
-            timeframe=TimeFrame.Minute,
-            limit=1
-        )
+        req = StockBarsRequest(symbol_or_symbols=[SYMBOL], timeframe=TimeFrame.Minute, limit=1)
         bars = data_api.get_stock_bars(req)
         if bars and SYMBOL in bars and len(bars[SYMBOL]) > 0:
              return float(bars[SYMBOL][0].close)
@@ -324,8 +351,7 @@ def get_latest_price() -> Optional[float]:
     return None
 
 def get_actual_position_shares() -> int:
-    if not api:
-        return 0
+    if not api: return 0
     try:
         p = api.get_open_position(SYMBOL)
         return int(float(p.qty))
@@ -333,9 +359,7 @@ def get_actual_position_shares() -> int:
         return 0
 
 def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
-    if qty <= 0 or not api:
-        return None
-    
+    if qty <= 0 or not api: return None
     side = OrderSide.BUY if side_str.lower() == 'buy' else OrderSide.SELL
     req = LimitOrderRequest(
         symbol=SYMBOL,
@@ -345,12 +369,10 @@ def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
         time_in_force=TimeInForce.DAY,
         extended_hours=True
     )
-
     try:
         order = api.submit_order(order_data=req)
         cur.execute(
-            "INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) VALUES (?,?,?,?,?,?)",
             (str(order.id), side_str, qty, price, str(order.status), int(time.time()))
         )
         conn.commit()
@@ -361,13 +383,9 @@ def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
         return None
 
 def reconcile_orders():
-    if not api:
-        return
+    if not api: return
     try:
-        cur.execute(
-            "SELECT id, alpaca_id FROM orders "
-            "WHERE status NOT IN ('filled','canceled','expired')"
-        )
+        cur.execute("SELECT id, alpaca_id FROM orders WHERE status NOT IN ('filled','canceled','expired')")
         rows = cur.fetchall()
         for rid, aid in rows:
             try:
@@ -388,42 +406,61 @@ def reconcile_orders():
                     elif order_side and order_side[0] == 'sell':
                         cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (lot_level,))
                         logger.info(f"Lot Level {lot_level} moved to CLOSED (Sold).")
-
             except Exception:
                 pass
         conn.commit()
     except Exception:
         logger.exception("Reconcile failed")
 
-# ---------- Safety / Maintenance ----------
-def is_paused() -> bool:
-    try:
-        cur.execute("SELECT val FROM meta WHERE key='paused'")
-        v = cur.fetchone()
-        return v[0] == "1" if v else False
-    except sqlite3.OperationalError:
-        return False
+# ---------- ANCHOR RESET LOGIC ----------
+def check_anchor_reset():
+    """Checks if Level 1 is CLOSED. If so, triggers Season Reset."""
+    cur.execute("SELECT status FROM virtual_lots WHERE level=1")
+    row = cur.fetchone()
+    if not row: return
 
-def set_paused(val: bool):
-    write_meta("paused", "1" if val else "0")
+    if row[0] == 'CLOSED':
+        logger.info(">>> ANCHOR (LEVEL 1) SOLD! TRIGGERING SEASON RESET <<<")
+        
+        # 1. Calculate and Save P/L
+        stats = get_season_stats()
+        final_pl = stats['current_pl']
+        write_meta('last_season_pl', str(final_pl))
+        logger.info(f"Season Ended. P/L: ${final_pl:.2f} banked.")
+
+        # 2. Update Starting Cash for NEXT season (Compounding)
+        if api:
+            # We use current equity (principal + profit) as the new start
+            acct = api.get_account()
+            new_cash = float(acct.equity)
+            write_meta('campaign_starting_equity', str(new_cash))
+            logger.info(f"Compounding! New Campaign Cash set to: ${new_cash:.2f}")
+
+        # 3. Wipe the Grid (Keep Meta)
+        cur.executescript("""
+            DELETE FROM virtual_lots;
+            DELETE FROM orders;
+        """)
+        conn.commit()
+        logger.info("Grid wiped. Ready for new Anchor at ATH.")
 
 # ---------- Core trading loop ----------
 async def trading_loop():
     logger.info("Starting trading loop")
     
-    try:
-        sync_alpaca_state()
-    except Exception as e:
-        logger.error(f"Error during startup sync: {e}")
+    try: sync_alpaca_state()
+    except Exception as e: logger.error(f"Error during startup sync: {e}")
 
-    try:
-        seed_virtual_ledger_if_empty()
-    except Exception as e:
-        logger.critical(f"Failed to seed ledger: {e}")
+    try: seed_virtual_ledger_if_empty()
+    except Exception as e: logger.critical(f"Failed to seed ledger: {e}")
         
     while True:
         try:
             reconcile_orders()
+            
+            # --- NEW: Check for Anchor Reset ---
+            check_anchor_reset()
+            
             if is_paused():
                 logger.info("Bot is paused (maintenance). Sleeping.")
                 await asyncio.sleep(POLL_MS/1000)
@@ -447,11 +484,12 @@ async def trading_loop():
             if cur.fetchone()[0] == 0:
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
                 target_price = price 
-                
-                # Aggressive Limit Price (+0.5%)
                 aggressive_limit_price = round(target_price * 1.005, 2)
                 
-                qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
+                # USE DYNAMIC CASH
+                current_cash_basis = get_dynamic_initial_cash()
+                
+                qty, buy_price_calc = compute_allocation_levels(target_price, 0, current_cash_basis, RF, LEVELS)
 
                 if qty > 0 and qty <= MAX_POSITION_SHARES:
                     sell_target = round(target_price * 1.01, 8) 
@@ -468,10 +506,7 @@ async def trading_loop():
 
             # --- RUNNING LOGIC ---
             # 1. SELL logic
-            cur.execute(
-                "SELECT level, virtual_shares, sell_target FROM virtual_lots "
-                "WHERE status='OPEN' ORDER BY level"
-            )
+            cur.execute("SELECT level, virtual_shares, sell_target FROM virtual_lots WHERE status='OPEN' ORDER BY level")
             open_lots = cur.fetchall()
             for level, vshares, sell_target in open_lots:
                 if price >= sell_target:
@@ -480,7 +515,6 @@ async def trading_loop():
                         logger.info(f"SELL TRIGGER level={level} target={sell_target} price={price}")
                         order_id = submit_order("sell", qty, sell_target)
                         if order_id:
-                            # SAFE SQL EXECUTION
                             cur.execute(
                                 "UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", 
                                 (order_id, level)
@@ -488,10 +522,7 @@ async def trading_loop():
                             conn.commit()
 
             # 2. BUY logic
-            cur.execute(
-                "SELECT level, virtual_shares, buy_price FROM virtual_lots "
-                "WHERE status='PENDING' ORDER BY level DESC"
-            )
+            cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING' ORDER BY level DESC")
             pending_rows = cur.fetchall()
             
             cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='ORDER_SENT'")
@@ -505,7 +536,10 @@ async def trading_loop():
                 anchor_price = anchor_result[0] if anchor_result else 0.0 
                 
                 if anchor_price > 0:
-                    qty, buy_target_price = compute_allocation_levels(anchor_price, max_level, INITIAL_CASH, RF, LEVELS)
+                    # USE DYNAMIC CASH
+                    current_cash_basis = get_dynamic_initial_cash()
+                    
+                    qty, buy_target_price = compute_allocation_levels(anchor_price, max_level, current_cash_basis, RF, LEVELS)
                     if qty > 0 and buy_target_price > 0:
                         sell_target = round(buy_target_price * 1.01, 8) 
                         cur.execute("""INSERT INTO virtual_lots
@@ -515,25 +549,19 @@ async def trading_loop():
                         conn.commit()
                         logger.info(f"Prepared next pending lot: Level {max_level + 1} @ ${buy_target_price:.2f}")
 
-            cur.execute(
-                "SELECT level, virtual_shares, buy_price FROM virtual_lots "
-                "WHERE status='PENDING' ORDER BY level DESC"
-            )
+            cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING' ORDER BY level DESC")
             pending_rows = cur.fetchall()
             actual_shares = reconciliation_status['actual_shares'] 
             
             for level, vshares, buy_price in pending_rows:
                 if price <= buy_price:
-                    if actual_shares + vshares > MAX_POSITION_SHARES:
-                        continue
+                    if actual_shares + vshares > MAX_POSITION_SHARES: continue
                     qty = int(vshares)
-                    if qty < MIN_ORDER_SHARES:
-                        continue
+                    if qty < MIN_ORDER_SHARES: continue
                     
                     logger.info(f"BUY TRIGGER level={level} price={price}")
                     order_id = submit_order("buy", qty, buy_price)
                     if order_id:
-                        # SAFE SQL EXECUTION
                         cur.execute(
                             "UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", 
                             (order_id, level)
@@ -544,12 +572,10 @@ async def trading_loop():
             logger.exception("Exception in trading loop")
         await asyncio.sleep(POLL_MS/1000)
 
-# ---------- Web UI (Now uses imported function) ----------
+# ---------- Web UI (Passes Season Stats) ----------
 async def handle_index(request):
     price = get_latest_price()
     pos = get_actual_position_shares()
-    
-    # Get all DB rows to pass to the template
     cur.execute("SELECT level, virtual_shares, buy_price, sell_target, status, alpaca_order_id FROM virtual_lots ORDER BY level ASC")
     db_rows = cur.fetchall()
     
@@ -562,8 +588,8 @@ async def handle_index(request):
     closed_cost = r[0] if r and r[0] else 0.0
     
     reco_status = get_reconciliation_status()
+    season_stats = get_season_stats()
     
-    # Generate the HTML using the imported function
     html = get_dashboard_html(
         SYMBOL, 
         price, 
@@ -573,7 +599,8 @@ async def handle_index(request):
         reco_status, 
         db_rows, 
         tail_log(200),
-        is_paused()
+        is_paused(),
+        season_stats
     )
     return web.Response(text=html, content_type='text/html')
 
