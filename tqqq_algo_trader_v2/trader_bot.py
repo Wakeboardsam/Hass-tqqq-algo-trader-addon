@@ -69,8 +69,6 @@ USE_PAPER = cfg.get("use_paper", True)
 SYMBOL = cfg.get("symbol", "TQQQ")
 RF = float(cfg.get("reduction_factor", 0.95))
 LEVELS = int(cfg.get("levels", 88))
-# NOTE: INITIAL_CASH here is only for the VERY FIRST run. 
-# Subsequent runs use the database value.
 CONFIG_INITIAL_CASH = float(cfg.get("initial_cash", 250000))
 
 POLL_MS = int(cfg.get("poll_interval_ms", 500))
@@ -160,7 +158,6 @@ def clear_log():
         return False
 
 def clear_db():
-    """Manual Hard Reset via Button (Wipes everything)"""
     try:
         cur.executescript("""
             DROP TABLE IF EXISTS virtual_lots;
@@ -195,32 +192,22 @@ def set_paused(val: bool):
 
 # ---------- Dynamic Cash Management ----------
 def get_dynamic_initial_cash() -> float:
-    """Returns the persistent cash value from DB, or config default if fresh."""
     val = read_meta('campaign_starting_equity')
     if val:
         return float(val)
-    
-    # If starting fresh, save the config value as the baseline
     write_meta('campaign_starting_equity', str(CONFIG_INITIAL_CASH))
     return CONFIG_INITIAL_CASH
 
 # ---------- P/L Tracking ----------
 def get_season_stats() -> dict:
-    """Calculates P/L for the current active campaign/season."""
     try:
-        # Get Current Equity from Alpaca
         equity = 0.0
         if api:
             acct = api.get_account()
             equity = float(acct.equity)
-        
-        # Get Starting Equity for this Campaign
         start_equity = get_dynamic_initial_cash()
-        
-        # Get Last Season's P/L
         last_pl = read_meta('last_season_pl')
         last_pl_val = float(last_pl) if last_pl else 0.0
-        
         return {
             "current_equity": equity,
             "starting_equity": start_equity,
@@ -236,19 +223,17 @@ def get_season_stats() -> dict:
             "last_season_pl": 0.0
         }
 
-# ---------- Reconciliation Check (UPDATED) ----------
+# ---------- Reconciliation Check ----------
 def get_reconciliation_status() -> dict:
     actual_shares = get_actual_position_shares()
     assumed_shares = 0
     total_db_allocation = 0.0
     
     try:
-        # 1. Sum fully OPEN lots
         cur.execute("SELECT SUM(virtual_shares) FROM virtual_lots WHERE status='OPEN'")
         open_shares = cur.fetchone()[0] or 0
         
-        # 2. Sum lots involved in pending orders (Partial Fills or In-Flight)
-        # This prevents the "Mismatch" error when an order is filled but DB isn't updated yet
+        # Count shares from pending orders to prevent race-condition mismatch
         pending_shares = 0
         if api:
             cur.execute("SELECT alpaca_order_id FROM virtual_lots WHERE status='ORDER_SENT'")
@@ -257,13 +242,11 @@ def get_reconciliation_status() -> dict:
                 if oid:
                     try:
                         o = api.get_order_by_id(oid)
-                        # Add whatever has been filled on this pending order to our "Assumed" count
                         pending_shares += int(float(o.filled_qty))
                     except Exception:
                         pass
 
         assumed_shares = open_shares + pending_shares
-
         cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status IN ('OPEN', 'CLOSED')")
         total_db_allocation = cur.fetchone()[0] or 0
         
@@ -277,7 +260,7 @@ def get_reconciliation_status() -> dict:
             account = api.get_account()
             account_cash = float(account.buying_power)
     except Exception:
-        logger.warning("Could not fetch Alpaca account buying power.")
+        pass
 
     reconciled = (actual_shares == assumed_shares)
     
@@ -394,9 +377,13 @@ def submit_order(side_str: str, qty: int, price: float) -> Optional[str]:
     )
     try:
         order = api.submit_order(order_data=req)
+        
+        # CRITICAL FIX: Use .value to store clean string status
+        status_str = order.status.value if hasattr(order.status, 'value') else str(order.status)
+        
         cur.execute(
             "INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) VALUES (?,?,?,?,?,?)",
-            (str(order.id), side_str, qty, price, str(order.status), int(time.time()))
+            (str(order.id), side_str, qty, price, status_str, int(time.time()))
         )
         conn.commit()
         logger.info(f"Submitted LIMIT {side_str} order qty={qty} @ ${price:.2f}")
@@ -413,27 +400,30 @@ def reconcile_orders():
         for rid, aid in rows:
             try:
                 o = api.get_order_by_id(aid)
-                order_status = str(o.status)
-                cur.execute("SELECT level FROM virtual_lots WHERE alpaca_order_id=?", (aid,))
-                lot_level_result = cur.fetchone()
-                lot_level = lot_level_result[0] if lot_level_result else None
+                
+                # CRITICAL FIX: Convert Enum status to plain string for comparison
+                order_status = o.status.value if hasattr(o.status, 'value') else str(o.status)
 
                 cur.execute("UPDATE orders SET status=? WHERE id=?", (order_status, rid))
 
-                # Handle Filled AND Partially Filled (to update status text)
-                if order_status == 'filled' and lot_level is not None:
-                    cur.execute("SELECT side FROM orders WHERE alpaca_id=?", (aid,))
-                    order_side = cur.fetchone()
-                    if order_side and order_side[0] == 'buy':
-                        cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE level=?", (lot_level,))
-                        logger.info(f"Lot Level {lot_level} moved to OPEN (Filled).")
-                    elif order_side and order_side[0] == 'sell':
-                        cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (lot_level,))
-                        logger.info(f"Lot Level {lot_level} moved to CLOSED (Sold).")
-                elif order_status == 'partially_filled' and lot_level is not None:
-                     # We keep it as ORDER_SENT but maybe log it?
-                     # The reconciliation check will now handle the qty mismatch safely.
-                     pass
+                # Now exact string matching works correctly
+                if order_status == 'filled':
+                    # Determine lot level
+                    cur.execute("SELECT level FROM virtual_lots WHERE alpaca_order_id=?", (aid,))
+                    lot_level_result = cur.fetchone()
+                    lot_level = lot_level_result[0] if lot_level_result else None
+                    
+                    if lot_level is not None:
+                        # Determine side from order table
+                        cur.execute("SELECT side FROM orders WHERE alpaca_id=?", (aid,))
+                        order_side_row = cur.fetchone()
+                        
+                        if order_side_row and order_side_row[0] == 'buy':
+                            cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE level=?", (lot_level,))
+                            logger.info(f"Lot Level {lot_level} moved to OPEN (Filled).")
+                        elif order_side_row and order_side_row[0] == 'sell':
+                            cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE level=?", (lot_level,))
+                            logger.info(f"Lot Level {lot_level} moved to CLOSED (Sold).")
 
             except Exception:
                 pass
@@ -443,29 +433,23 @@ def reconcile_orders():
 
 # ---------- ANCHOR RESET LOGIC ----------
 def check_anchor_reset():
-    """Checks if Level 1 is CLOSED. If so, triggers Season Reset."""
     cur.execute("SELECT status FROM virtual_lots WHERE level=1")
     row = cur.fetchone()
     if not row: return
 
     if row[0] == 'CLOSED':
         logger.info(">>> ANCHOR (LEVEL 1) SOLD! TRIGGERING SEASON RESET <<<")
-        
-        # 1. Calculate and Save P/L
         stats = get_season_stats()
         final_pl = stats['current_pl']
         write_meta('last_season_pl', str(final_pl))
         logger.info(f"Season Ended. P/L: ${final_pl:.2f} banked.")
 
-        # 2. Update Starting Cash for NEXT season (Compounding)
         if api:
-            # We use current equity (principal + profit) as the new start
             acct = api.get_account()
             new_cash = float(acct.equity)
             write_meta('campaign_starting_equity', str(new_cash))
             logger.info(f"Compounding! New Campaign Cash set to: ${new_cash:.2f}")
 
-        # 3. Wipe the Grid (Keep Meta)
         cur.executescript("""
             DELETE FROM virtual_lots;
             DELETE FROM orders;
@@ -486,11 +470,8 @@ async def trading_loop():
     while True:
         try:
             reconcile_orders()
-            
-            # --- NEW: Check for Anchor Reset ---
             check_anchor_reset()
             
-            # Even if paused, we run reconcile above. But we skip NEW logic below.
             if is_paused():
                 logger.info("Bot is paused (maintenance or mismatch). Sleeping.")
                 await asyncio.sleep(POLL_MS/1000)
@@ -504,8 +485,6 @@ async def trading_loop():
             reconciliation_status = get_reconciliation_status()
             if not reconciliation_status['reconciled']:
                 logger.warning(f"MISMATCH: DB {reconciliation_status['assumed_shares']} != Alpaca {reconciliation_status['actual_shares']}. Paused.")
-                # We do NOT set_paused(True) here because that requires manual intervention.
-                # Instead we just sleep/continue, effectively pausing loop logic until mismatch resolves.
                 await asyncio.sleep(POLL_MS/1000)
                 continue
 
@@ -517,10 +496,7 @@ async def trading_loop():
                 logger.info("--- STARTUP: Placing Level 1 Anchor Buy ---")
                 target_price = price 
                 aggressive_limit_price = round(target_price * 1.005, 2)
-                
-                # USE DYNAMIC CASH
                 current_cash_basis = get_dynamic_initial_cash()
-                
                 qty, buy_price_calc = compute_allocation_levels(target_price, 0, current_cash_basis, RF, LEVELS)
 
                 if qty > 0 and qty <= MAX_POSITION_SHARES:
@@ -547,16 +523,12 @@ async def trading_loop():
                         logger.info(f"SELL TRIGGER level={level} target={sell_target} price={price}")
                         order_id = submit_order("sell", qty, sell_target)
                         if order_id:
-                            cur.execute(
-                                "UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", 
-                                (order_id, level)
-                            )
+                            cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (order_id, level))
                             conn.commit()
 
             # 2. BUY logic
             cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING' ORDER BY level DESC")
             pending_rows = cur.fetchall()
-            
             cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='ORDER_SENT'")
             orders_sent_count = cur.fetchone()[0]
             
@@ -566,11 +538,8 @@ async def trading_loop():
                 cur.execute("SELECT buy_price FROM virtual_lots WHERE level=1")
                 anchor_result = cur.fetchone()
                 anchor_price = anchor_result[0] if anchor_result else 0.0 
-                
                 if anchor_price > 0:
-                    # USE DYNAMIC CASH
                     current_cash_basis = get_dynamic_initial_cash()
-                    
                     qty, buy_target_price = compute_allocation_levels(anchor_price, max_level, current_cash_basis, RF, LEVELS)
                     if qty > 0 and buy_target_price > 0:
                         sell_target = round(buy_target_price * 1.01, 8) 
@@ -590,50 +559,30 @@ async def trading_loop():
                     if actual_shares + vshares > MAX_POSITION_SHARES: continue
                     qty = int(vshares)
                     if qty < MIN_ORDER_SHARES: continue
-                    
                     logger.info(f"BUY TRIGGER level={level} price={price}")
                     order_id = submit_order("buy", qty, buy_price)
                     if order_id:
-                        cur.execute(
-                            "UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", 
-                            (order_id, level)
-                        )
+                        cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (order_id, level))
                         conn.commit()
             
         except Exception:
             logger.exception("Exception in trading loop")
         await asyncio.sleep(POLL_MS/1000)
 
-# ---------- Web UI (Passes Season Stats) ----------
 async def handle_index(request):
     price = get_latest_price()
     pos = get_actual_position_shares()
     cur.execute("SELECT level, virtual_shares, buy_price, sell_target, status, alpaca_order_id FROM virtual_lots ORDER BY level ASC")
     db_rows = cur.fetchall()
-    
     cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='OPEN'")
     r = cur.fetchone()
     open_cost = r[0] if r and r[0] else 0.0
-    
     cur.execute("SELECT SUM(virtual_cost) FROM virtual_lots WHERE status='CLOSED'")
     r = cur.fetchone()
     closed_cost = r[0] if r and r[0] else 0.0
-    
     reco_status = get_reconciliation_status()
     season_stats = get_season_stats()
-    
-    html = get_dashboard_html(
-        SYMBOL, 
-        price, 
-        pos, 
-        open_cost, 
-        closed_cost, 
-        reco_status, 
-        db_rows, 
-        tail_log(200),
-        is_paused(),
-        season_stats
-    )
+    html = get_dashboard_html(SYMBOL, price, pos, open_cost, closed_cost, reco_status, db_rows, tail_log(200), is_paused(), season_stats)
     return web.Response(text=html, content_type='text/html')
 
 async def api_clear_db(request):
@@ -647,15 +596,7 @@ async def api_status(request):
     open_count = cur.fetchone()[0]
     cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='CLOSED'")
     closed_count = cur.fetchone()[0]
-    data = {
-        "symbol": SYMBOL,
-        "price": price,
-        "position_shares": pos,
-        "open_virtual_lots": open_count,
-        "closed_virtual_lots": closed_count,
-        "reduction_factor": RF,
-        "paused": is_paused()
-    }
+    data = {"symbol": SYMBOL, "price": price, "position_shares": pos, "open_virtual_lots": open_count, "closed_virtual_lots": closed_count, "reduction_factor": RF, "paused": is_paused()}
     return web.json_response(data)
 
 async def api_levels(request):
@@ -663,14 +604,7 @@ async def api_levels(request):
     rows = cur.fetchall()
     levels = []
     for r in rows:
-        levels.append({
-            "level": r[0],
-            "virtual_shares": r[1],
-            "virtual_cost": r[2],
-            "buy_price": r[3],
-            "sell_target": r[4],
-            "status": r[5]
-        })
+        levels.append({"level": r[0], "virtual_shares": r[1], "virtual_cost": r[2], "buy_price": r[3], "sell_target": r[4], "status": r[5]})
     return web.json_response({"levels": levels})
 
 async def api_logs(request):
