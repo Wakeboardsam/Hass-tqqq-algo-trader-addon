@@ -1,4 +1,3 @@
-# tqqq_bot_tester/bot_tester.py
 import asyncio
 import os
 import sqlite3
@@ -24,7 +23,6 @@ from aiohttp import web
 from webui_assets import get_dashboard_html
 
 # ---------- SIMULATION PERSISTENCE ----------
-# ISOLATED FOLDER: /config/tqqq-bot-tester
 CONFIG_DIR = "/config/tqqq-bot-tester"
 if not os.path.exists(CONFIG_DIR):
     try:
@@ -42,19 +40,16 @@ logger = logging.getLogger("tqqq-tester")
 BOT_CONFIG = "/data/options.json"
 LEDGER_DB = os.path.join(CONFIG_DIR, "tester_ledger.db")
 
-# Global Config Cache
 sim_config = {}
 
 def reload_config():
-    """Reads config every loop to catch manual price changes from the UI."""
     global sim_config
     try:
         with open(BOT_CONFIG, 'r') as f:
             sim_config = json.load(f)
     except Exception:
-        pass # Keep old config if read fails
+        pass
 
-# Initial Load
 reload_config()
 
 # Timezone Setup
@@ -75,12 +70,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 
 logger.info(f"--- STARTING SIMULATION BOT ---")
 logger.info(f"Timezone: {TZ_STR}")
-logger.info(f"Persistence: {CONFIG_DIR}")
-
-# ---------- SIMULATION STATE ----------
-# Since we don't have Alpaca, we track "Account" in memory or DB.
-# For simplicity, we calculate Equity = Cash + (Shares * SimPrice)
-# We store "Simulated Cash" in the Meta table.
 
 # ---------- SQLite ledger setup ----------
 conn = sqlite3.connect(LEDGER_DB, check_same_thread=False)
@@ -123,13 +112,14 @@ def tail_log(n=200):
     except: return ""
 
 def clear_db():
+    # FIX: Use DELETE instead of DROP so tables remain for the next loop
     cur.executescript("""
-        DROP TABLE IF EXISTS virtual_lots;
-        DROP TABLE IF EXISTS orders;
-        DROP TABLE IF EXISTS meta;
+        DELETE FROM virtual_lots;
+        DELETE FROM orders;
+        DELETE FROM meta;
     """)
     conn.commit()
-    logger.info("SIMULATION RESET. Database wiped.")
+    logger.info("SIMULATION RESET. Database wiped. Will reload config defaults on next tick.")
 
 def write_meta(key, val):
     cur.execute("INSERT OR REPLACE INTO meta (key,val) VALUES (?,?)", (key, str(val)))
@@ -140,18 +130,21 @@ def read_meta(key):
     r = cur.fetchone()
     return r[0] if r else None
 
+def is_paused():
+    return read_meta('paused') == "1"
+
+def set_paused(val):
+    write_meta('paused', "1" if val else "0")
+
 # ---------- SIMULATION LOGIC ----------
 
 def get_sim_price():
-    """Reads the 'manual_market_price' from the config tab."""
     reload_config()
     return float(sim_config.get("manual_market_price", 100.00))
 
 def get_sim_cash():
-    """Gets simulated cash on hand."""
     c = read_meta('sim_cash')
     if c is None:
-        # Initialize with config cash
         start = float(sim_config.get("initial_cash", 100000))
         write_meta('sim_cash', start)
         return start
@@ -164,31 +157,19 @@ def update_sim_cash(amount_change):
     return new_val
 
 def get_sim_shares():
-    """Calculates total shares held based on OPEN lots in DB."""
-    # In simulation, we trust the DB 100% because there is no external broker.
     cur.execute("SELECT SUM(virtual_shares) FROM virtual_lots WHERE status='OPEN'")
     return cur.fetchone()[0] or 0
 
 def submit_sim_order(side, qty, price):
-    """Creates a 'Pending' order in the database."""
     sim_id = f"SIM-{uuid.uuid4().hex[:8]}"
     logger.info(f"SIMULATED ORDER: {side.upper()} {qty} @ ${price:.2f} (ID: {sim_id})")
-    
-    # Record the order
     cur.execute("INSERT INTO orders (alpaca_id, side, qty, price, status, created_at) VALUES (?,?,?,?,?,?)",
                 (sim_id, side, qty, price, "new", int(time.time())))
     conn.commit()
     return sim_id
 
 def match_engine():
-    """
-    The Heart of the Simulator.
-    Checks open orders against the Manual Market Price.
-    If price crosses limit, FILLS the order.
-    """
     current_price = get_sim_price()
-    
-    # 1. Get all pending orders
     cur.execute("SELECT id, alpaca_id, side, qty, price FROM orders WHERE status='new'")
     pending_orders = cur.fetchall()
     
@@ -197,36 +178,28 @@ def match_engine():
         filled = False
         
         if side == 'buy' and current_price <= limit_price:
-            # Price dropped enough to buy
             filled = True
             cost = qty * limit_price
-            update_sim_cash(-cost) # Spend Cash
+            update_sim_cash(-cost)
             logger.info(f"⚡ SIM FILL: BOUGHT {qty} @ ${limit_price:.2f} (Market: ${current_price})")
             
         elif side == 'sell' and current_price >= limit_price:
-            # Price rose enough to sell
             filled = True
             proceeds = qty * limit_price
-            update_sim_cash(proceeds) # Receive Cash
+            update_sim_cash(proceeds)
             logger.info(f"⚡ SIM FILL: SOLD {qty} @ ${limit_price:.2f} (Market: ${current_price})")
             
         if filled:
-            # Update Order Table
             cur.execute("UPDATE orders SET status='filled' WHERE id=?", (oid,))
-            
-            # Update Virtual Lots Table
             if side == 'buy':
-                # Find the lot waiting for this order
                 cur.execute("UPDATE virtual_lots SET status='OPEN' WHERE alpaca_order_id=?", (alpaca_id,))
             elif side == 'sell':
                 cur.execute("UPDATE virtual_lots SET status='CLOSED' WHERE alpaca_order_id=?", (alpaca_id,))
-            
             conn.commit()
 
-# ---------- STANDARD BOT LOGIC (Adapted for Sim) ----------
+# ---------- STANDARD BOT LOGIC ----------
 
 def compute_allocation_levels(anchor_price, current_level, starting_cash, rf, total_levels):
-    # Same math as production
     next_level = current_level + 1
     if next_level > total_levels: return 0, 0.0
     denom = (1 - (rf ** total_levels)) if rf != 1.0 else total_levels
@@ -238,31 +211,31 @@ def compute_allocation_levels(anchor_price, current_level, starting_cash, rf, to
     return shares, buy_price
 
 async def simulation_loop():
-    logger.info("Simulation Loop Started. Change 'manual_market_price' in Config to move market.")
+    logger.info("Simulation Loop Started.")
     
     while True:
         try:
-            # 1. Refresh Config (Price)
             reload_config()
             price = get_sim_price()
             
-            # 2. Run Match Engine (Check if orders fill)
+            # Check Pause
+            if is_paused():
+                await asyncio.sleep(1)
+                continue
+
             match_engine()
             
-            # 3. Check Anchor Reset (Season logic)
+            # Anchor Reset
             cur.execute("SELECT status FROM virtual_lots WHERE level=1")
             row = cur.fetchone()
             if row and row[0] == 'CLOSED':
                 logger.info(">>> SIMULATION: ANCHOR SOLD! RESETTING SEASON <<<")
-                # Reset DB but keep cash
                 cur.executescript("DELETE FROM virtual_lots; DELETE FROM orders;")
                 conn.commit()
-                # Update starting equity for next season
-                current_equity = get_sim_cash() # shares are 0, so equity = cash
+                current_equity = get_sim_cash()
                 write_meta('campaign_starting_equity', current_equity)
 
-            # 4. Trading Logic
-            # Get Start Cash
+            # Get Start Cash (or init from config)
             start_cash_val = read_meta('campaign_starting_equity')
             if not start_cash_val:
                 start_cash_val = sim_config.get("initial_cash", 100000)
@@ -286,7 +259,6 @@ async def simulation_loop():
                 conn.commit()
                 
             # RUNNING
-            # Sell Logic
             cur.execute("SELECT level, virtual_shares, sell_target FROM virtual_lots WHERE status='OPEN'")
             for lvl, qty, target in cur.fetchall():
                 if price >= target:
@@ -295,17 +267,11 @@ async def simulation_loop():
                     cur.execute("UPDATE virtual_lots SET status='ORDER_SENT', alpaca_order_id=? WHERE level=?", (oid, lvl))
                     conn.commit()
 
-            # Buy Logic
             cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING' ORDER BY level DESC")
             pending = cur.fetchall()
             
-            # Check if we need to generate next pending level
             cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='ORDER_SENT'")
             if not pending and cur.fetchone()[0] == 0:
-                cur.execute("SELECT MAX(level), buy_price FROM virtual_lots WHERE level=1")
-                # Need Anchor Price to calculate next level
-                anchor_row = cur.fetchone() # This query is wrong, let's fix
-                
                 cur.execute("SELECT buy_price FROM virtual_lots WHERE level=1")
                 ar = cur.fetchone()
                 cur.execute("SELECT MAX(level) FROM virtual_lots")
@@ -322,7 +288,6 @@ async def simulation_loop():
                         conn.commit()
                         logger.info(f"Generated Plan for Level {max_lvl+1} @ ${buy_target}")
 
-            # Execute Buys
             cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING'")
             for lvl, qty, target in cur.fetchall():
                 if price <= target:
@@ -334,7 +299,7 @@ async def simulation_loop():
         except Exception:
             logger.exception("Sim Loop Error")
         
-        await asyncio.sleep(1) # Check every second
+        await asyncio.sleep(1)
 
 # ---------- Web App ----------
 async def handle_index(request):
@@ -347,16 +312,21 @@ async def handle_index(request):
     cur.execute("SELECT level, virtual_shares, buy_price, sell_target, status, alpaca_order_id FROM virtual_lots ORDER BY level ASC")
     rows = cur.fetchall()
     
-    start_equity = float(read_meta('campaign_starting_equity') or sim_config.get("initial_cash", 100000))
+    start_equity_val = read_meta('campaign_starting_equity')
+    if start_equity_val:
+        start_equity = float(start_equity_val)
+    else:
+        start_equity = float(sim_config.get("initial_cash", 100000))
+
     season_stats = {
         "current_equity": equity,
         "starting_equity": start_equity,
         "current_pl": equity - start_equity,
-        "last_season_pl": 0.0 # TODO: Store this on reset
+        "last_season_pl": 0.0
     }
     
     reco = {
-        "reconciled": True, # Always true in sim
+        "reconciled": True,
         "assumed_shares": shares,
         "actual_shares": shares,
         "alpaca_cash": cash,
@@ -364,7 +334,7 @@ async def handle_index(request):
     }
     
     html = get_dashboard_html(
-        sim_config.get("symbol", "SIM"), price, shares, 0, 0, reco, rows, tail_log(), False, season_stats
+        sim_config.get("symbol", "SIM"), price, shares, 0, 0, reco, rows, tail_log(), is_paused(), season_stats
     )
     return web.Response(text=html, content_type='text/html')
 
@@ -372,16 +342,27 @@ async def api_clear_db(request):
     clear_db()
     raise web.HTTPFound('/')
 
+async def api_pause(request):
+    set_paused(True)
+    raise web.HTTPFound('/')
+
+async def api_resume(request):
+    set_paused(False)
+    raise web.HTTPFound('/')
+
 def create_app():
     app = web.Application()
     app.router.add_get('/', handle_index)
     app.router.add_post('/api/clear-db', api_clear_db)
+    app.router.add_post('/api/pause', api_pause)
+    app.router.add_post('/api/resume', api_resume)
     return app
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     app = create_app()
-    runner = web.AppRunner(app)
+    # FIX: Disable access_log to stop the console spam
+    runner = web.AppRunner(app, access_log=None)
     loop.run_until_complete(runner.setup())
     port = sim_config.get("webui_port", 8081)
     site = web.TCPSite(runner, '0.0.0.0', port)
