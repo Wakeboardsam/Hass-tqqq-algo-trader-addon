@@ -7,7 +7,6 @@ import logging
 import json
 from dataclasses import dataclass
 from typing import List, Optional
-# CRITICAL FIX: Import timezone explicitly
 from datetime import datetime, timedelta, timezone
 
 # --- Timezone Support ---
@@ -32,7 +31,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
+from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 
 # ---------- PERSISTENCE SETUP ----------
@@ -71,7 +70,6 @@ except Exception:
 
 def local_time(*args):
     """Helper to convert UTC to User's Configured Timezone for Logging"""
-    # FIX: Use timezone.utc directly
     utc_dt = datetime.now(timezone.utc)
     my_dt = utc_dt.astimezone(MY_TIMEZONE)
     return my_dt.timetuple()
@@ -293,7 +291,6 @@ def get_reconciliation_status() -> dict:
 
     reconciled = (actual_shares == assumed_shares)
     
-    # FIX: Use timezone.utc directly
     now_mt = datetime.now(timezone.utc).astimezone(MY_TIMEZONE)
     
     return {
@@ -373,12 +370,26 @@ def seed_virtual_ledger_if_empty():
 # ---------- Alpaca helpers ----------
 def get_latest_price() -> Optional[float]:
     if not data_api: return None
+    
+    # 1. Try Quote (Best Ask) - Most reliable for immediate fill
+    try:
+        req = StockLatestQuoteRequest(symbol_or_symbols=[SYMBOL])
+        quote = data_api.get_stock_latest_quote(req)
+        # Use Ask Price because we are buying
+        if quote[SYMBOL].ask_price > 0:
+            return float(quote[SYMBOL].ask_price)
+    except Exception:
+        pass
+
+    # 2. Fallback to Trade (Last Traded Price)
     try:
         req = StockLatestTradeRequest(symbol_or_symbols=[SYMBOL])
         trade = data_api.get_stock_latest_trade(req)
         return float(trade[SYMBOL].price)
     except Exception:
         pass
+        
+    # 3. Fallback to Bar (Minute Bar Close)
     try:
         req = StockBarsRequest(symbol_or_symbols=[SYMBOL], timeframe=TimeFrame.Minute, limit=1)
         bars = data_api.get_stock_bars(req)
@@ -534,6 +545,18 @@ async def trading_loop():
                 continue
 
             # --- RUNNING LOGIC ---
+            
+            # 0. PING-PONG LOGIC (Re-activate CLOSED lots if price drops)
+            cur.execute("SELECT level, buy_price FROM virtual_lots WHERE status='CLOSED'")
+            closed_lots = cur.fetchall()
+            for level, buy_price in closed_lots:
+                # If current price is below or equal to the original buy price of a closed lot
+                if price <= buy_price:
+                    logger.info(f"PING-PONG TRIGGER: Price ${price} <= Buy Target ${buy_price}. Reactivating Level {level}.")
+                    # Reset status to PENDING so the BUY logic picks it up immediately below
+                    cur.execute("UPDATE virtual_lots SET status='PENDING' WHERE level=?", (level,))
+                    conn.commit()
+
             # 1. SELL logic
             cur.execute("SELECT level, virtual_shares, sell_target FROM virtual_lots WHERE status='OPEN' ORDER BY level")
             open_lots = cur.fetchall()
@@ -574,8 +597,12 @@ async def trading_loop():
                         conn.commit()
                         logger.info(f"Prepared next pending lot: Level {max_level + 1} @ ${buy_target_price:.2f}")
 
+            # Re-fetch PENDING in case PING-PONG added some
             cur.execute("SELECT level, virtual_shares, buy_price FROM virtual_lots WHERE status='PENDING' ORDER BY level DESC")
             pending_rows = cur.fetchall()
+            
+            # Need fresh reconciliation count since we might have just sold something in the loop
+            reconciliation_status = get_reconciliation_status()
             actual_shares = reconciliation_status['actual_shares'] 
             
             for level, vshares, buy_price in pending_rows:
