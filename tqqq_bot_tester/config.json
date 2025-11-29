@@ -1,6 +1,6 @@
 {
   "name": "TQQQ Bot Tester (Simulation)",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "slug": "tqqq_bot_tester",
   "description": "Simulation Sandbox for TQQQ Grid Strategy. No Real Trading.",
   "arch": ["amd64", "armv7", "aarch64", "armhf"],
