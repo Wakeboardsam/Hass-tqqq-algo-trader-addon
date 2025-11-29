@@ -1,5 +1,3 @@
-# tqqq_bot_tester/webui_assets.py
-
 def get_dashboard_html(symbol, price, pos, open_cost, closed_cost, reco_status, db_rows, tail_log, is_paused, season_stats):
     
     # Table Rows Logic
@@ -23,7 +21,7 @@ def get_dashboard_html(symbol, price, pos, open_cost, closed_cost, reco_status, 
     # Alerts
     alerts_html = ""
     if is_paused:
-        alerts_html += "<div style='background:#fff3cd; color:#856404; padding:10px; margin:10px 0;'><strong>PAUSED</strong></div>"
+        alerts_html += "<div style='background:#fff3cd; color:#856404; padding:15px; margin:10px 0; border: 1px solid #ffeeba; border-radius: 5px;'><strong>SIMULATION PAUSED</strong></div>"
 
     pl_color = "green" if season_stats['current_pl'] >= 0 else "red"
 
@@ -32,7 +30,8 @@ def get_dashboard_html(symbol, price, pos, open_cost, closed_cost, reco_status, 
     <html>
     <head>
         <title>SIMULATION: {symbol}</title>
-        <meta http-equiv="refresh" content="2"> <style>
+        <meta http-equiv="refresh" content="2">
+        <style>
             body {{ font-family: sans-serif; padding: 20px; background-color: #f0f0f0; }}
             .sim-banner {{ background: #6f42c1; color: white; padding: 10px; text-align: center; font-weight: bold; border-radius: 5px; margin-bottom: 20px; }}
             .card-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 20px; }}
@@ -43,6 +42,8 @@ def get_dashboard_html(symbol, price, pos, open_cost, closed_cost, reco_status, 
             th, td {{ padding: 10px; text-align: center; border-bottom: 1px solid #eee; }}
             th {{ background: #ddd; }}
             pre {{ background: #222; color: #0f0; padding: 15px; max-height: 300px; overflow-y: auto; }}
+            button {{ padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 10px; }}
+            .btn-group {{ margin-bottom: 20px; display: flex; }}
         </style>
     </head>
     <body>
@@ -62,9 +63,11 @@ def get_dashboard_html(symbol, price, pos, open_cost, closed_cost, reco_status, 
             <div class="card"><h4>Simulated Cash</h4><p>${reco_status['alpaca_cash']:,.2f}</p></div>
         </div>
 
-        <form method="post" action="/api/clear-db" style="margin-bottom: 20px;">
-            <button style="background:red; color:white; padding:10px; border:none; cursor:pointer;">RESET SIMULATION</button>
-        </form>
+        <div class="btn-group">
+            <form method="post" action="/api/pause"><button style="background:#ffc107;">PAUSE</button></form>
+            <form method="post" action="/api/resume"><button style="background:#28a745; color:white;">RESUME</button></form>
+            <form method="post" action="/api/clear-db"><button style="background:#dc3545; color:white;">RESET SIMULATION</button></form>
+        </div>
 
         <h3>Strategy Ledger</h3>
         <table>
