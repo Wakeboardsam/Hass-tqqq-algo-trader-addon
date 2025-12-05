@@ -304,7 +304,6 @@ def reconcile_orders():
                         logger.info(f"Lot Level {lot_level} moved to CLOSED (Sold).")
 
             except Exception as e:
-                # FIXED: Log failures so we know why orders aren't updating
                 logger.error(f"Failed to reconcile order {aid}: {e}")
                 pass
         conn.commit()
@@ -349,28 +348,15 @@ async def trading_loop():
             reconciliation_status = get_reconciliation_status()
             actual_shares = reconciliation_status['actual_shares']
 
-            if not reconciliation_status['reconciled']:
-                # Grace period check
-                cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='ORDER_SENT'")
-                orders_in_flight = cur.fetchone()[0]
-                
-                if orders_in_flight > 0:
-                    logger.info(f"Reconciliation Mismatch ({reconciliation_status['shares_delta']} shares), but {orders_in_flight} orders are in flight. Assuming grace period/partial fill. Continuing.")
-                else:
-                    logger.warning(f"RECONCILIATION MISMATCH: DB Assumed {reconciliation_status['assumed_shares']} shares, Alpaca reports {reconciliation_status['actual_shares']} shares. Delta: {reconciliation_status['shares_delta']}. Bot action paused.")
-                    await asyncio.sleep(POLL_MS/1000)
-                    continue
-
-            
-            # --- STARTUP LOGIC: Correct Handling of Ghost Shares ---
+            # --- STARTUP LOGIC: RUN BEFORE SAFETY CHECK ---
+            # If the DB is empty (after clear) but we have shares, we MUST adopt them.
             cur.execute("SELECT COUNT(1) FROM virtual_lots")
-            if cur.fetchone()[0] == 0:
-                logger.info("--- STARTUP SEQUENCE ---")
-                
+            db_row_count = cur.fetchone()[0]
+            
+            if db_row_count == 0:
                 if actual_shares > 0:
-                    # SCENARIO A: DB is empty, but we already have shares.
-                    # ACTION: Adopt these shares as Level 1 "OPEN" immediately. Do NOT buy more.
-                    logger.warning(f"Startup: Found {actual_shares} existing shares in Alpaca but DB is empty.")
+                    # SCENARIO A: Adopt Existing Shares
+                    logger.warning(f"Startup/Reset: Found {actual_shares} existing shares in Alpaca but DB is empty.")
                     logger.warning("ADOPTING existing position as Level 1 Anchor to prevent double-buy.")
                     
                     sell_target = round(price * 1.01, 8)
@@ -380,13 +366,11 @@ async def trading_loop():
                         (1, actual_shares, price * actual_shares, price, sell_target, "OPEN", int(time.time())))
                     conn.commit()
                     logger.info("Existing shares adopted. Grid initiated from current position.")
-                    continue
-
+                    continue # Loop back to refresh status with new DB data
+                
                 else:
-                    # SCENARIO B: DB is empty, Alpaca is empty.
-                    # ACTION: Standard Anchor Buy.
+                    # SCENARIO B: Clean Start (Buy Level 1)
                     logger.info("Clean start detected. Placing Level 1 Anchor Buy.")
-                    
                     target_price = price 
                     aggressive_limit_price = round(target_price + 0.05, 2)
                     qty, buy_price_calc = compute_allocation_levels(target_price, 0, INITIAL_CASH, RF, LEVELS)
@@ -401,11 +385,23 @@ async def trading_loop():
                                 VALUES (?,?,?,?,?,?,?,?)""",
                                 (1, qty, target_price*qty, target_price, sell_target, "ORDER_SENT", int(time.time()), order_id))
                             conn.commit()
-                    
-                    logger.info(f"Anchor Buy submitted: QTY={qty} @ ${aggressive_limit_price:.2f}.")
+                            logger.info(f"Anchor Buy submitted: QTY={qty} @ ${aggressive_limit_price:.2f}.")
+                            await asyncio.sleep(POLL_MS/1000)
+                            continue
+            # --- END STARTUP LOGIC ---
+
+            # --- SAFETY CHECK (Run AFTER potential adoption) ---
+            if not reconciliation_status['reconciled']:
+                # Grace period check
+                cur.execute("SELECT COUNT(1) FROM virtual_lots WHERE status='ORDER_SENT'")
+                orders_in_flight = cur.fetchone()[0]
+                
+                if orders_in_flight > 0:
+                    logger.info(f"Reconciliation Mismatch ({reconciliation_status['shares_delta']} shares), but {orders_in_flight} orders are in flight. Assuming grace period/partial fill. Continuing.")
+                else:
+                    logger.warning(f"RECONCILIATION MISMATCH: DB Assumed {reconciliation_status['assumed_shares']} shares, Alpaca reports {reconciliation_status['actual_shares']} shares. Delta: {reconciliation_status['shares_delta']}. Bot action paused.")
                     await asyncio.sleep(POLL_MS/1000)
                     continue
-            # --- END STARTUP LOGIC ---
 
             # --- RUNNING LOGIC ---
             
