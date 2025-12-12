@@ -1,7 +1,7 @@
 name: "TQQQ Volatility Bot"
 version: "1.0.0"
 slug: "tqqq_bot"
-description: "Sequential Allocation Matrix Bot"
+description: "IBKR Sequential Allocation Matrix Bot"
 arch:
   - aarch64
   - amd64
