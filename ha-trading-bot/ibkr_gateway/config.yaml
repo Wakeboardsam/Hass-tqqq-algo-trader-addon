@@ -1,1 +1,22 @@
-test
+name: "IBKR Gateway"
+version: "1.0.0"
+slug: "ibkr_gateway"
+description: "Headless Interactive Brokers Gateway"
+arch:
+  - aarch64
+  - amd64
+startup: services
+map:
+  - "share:rw" # Allows saving logs/config to shared folder
+ports:
+  4001/tcp: 4001 # Live Trading Port
+  4002/tcp: 4002 # Paper Trading Port
+  5900/tcp: 5900 # VNC Port (for initial login)
+options:
+  tws_userid: "YOUR_USERNAME"
+  tws_password: "YOUR_PASSWORD"
+  trading_mode: "live" 
+schema:
+  tws_userid: str
+  tws_password: str
+  trading_mode: list(live|paper)
