@@ -1,5 +1,5 @@
 name: "TQQQ Volatility Bot"
-version: "1.0.2"
+version: "1.0.3"
 slug: "tqqq_bot"
 description: "IBKR Sequential Allocation Matrix Bot"
 arch:
